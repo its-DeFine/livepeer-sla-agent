@@ -1,0 +1,63 @@
+# Livepeer SLA Stack
+#
+# Start everything:
+#   docker-compose up -d
+#
+# View dashboard:
+#   http://localhost:8080
+#
+# This runs:
+#   - Dashboard on port 8080 (collects attestations, shows top 100)
+#   - Example agent on port 9090 (for testing)
+
+services:
+  # Dashboard - collects attestations, verifies nodes, shows top 100
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: dashboard
+    ports:
+      - "8080:8080"
+    volumes:
+      - dashboard-data:/app/data
+    environment:
+      - DASHBOARD_PORT=8080
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # Example agent (for testing - in production, orchestrators run this)
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: agent
+    ports:
+      - "9090:9090"
+    volumes:
+      - agent-identity:/root/.livepeer-sla
+    environment:
+      - DASHBOARD_URL=http://dashboard:8080
+      - HEARTBEAT_INTERVAL=30
+      - AGENT_PORT=9090
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  dashboard-data:
+    driver: local
+  agent-identity:
+    driver: local

@@ -1,0 +1,36 @@
+[project]
+name = "livepeer-sla-agent"
+version = "0.1.0"
+description = "Lightweight SLA attestation agent for Livepeer orchestrators"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "httpx>=0.26.0",
+    "pynacl>=1.5.0",           # Ed25519 signatures
+    "psutil>=5.9.0",           # System capability detection
+    "GPUtil>=1.4.0",           # GPU detection
+    "pydantic>=2.5.0",
+    "rich>=13.7.0",            # CLI output
+    "typer>=0.9.0",            # CLI framework
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+]
+eth = [
+    "eth-account>=0.10.0",  # For ETH signature verification (address linking)
+]
+
+[project.scripts]
+sla-agent = "agent.cli:app"
+sla-dashboard = "dashboard.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent", "dashboard"]
