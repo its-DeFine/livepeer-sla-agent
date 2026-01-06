@@ -334,6 +334,106 @@ class LivepeerSubgraph:
         return sorted(daily.values(), key=lambda x: x["date"])
 
 
+    async def get_gateway_traffic(
+        self,
+        gateway_address: Optional[str] = None,
+        hours: int = 24
+    ) -> list[dict]:
+        """
+        Get traffic breakdown by gateway (broadcaster).
+
+        Shows which orchestrators each gateway is sending work to.
+        If gateway_address is provided, filter to that specific gateway.
+        """
+        since = int((datetime.utcnow() - timedelta(hours=hours)).timestamp())
+
+        where_clause = f"timestamp_gte: {since}"
+        if gateway_address:
+            where_clause += f', sender: "{gateway_address.lower()}"'
+
+        query = f"""
+        query GetGatewayTraffic {{
+            winningTicketRedeemedEvents(
+                where: {{ {where_clause} }}
+                first: 1000
+                orderBy: timestamp
+                orderDirection: desc
+            ) {{
+                sender
+                recipient
+                faceValue
+                timestamp
+            }}
+        }}
+        """
+
+        data = await self._query(query)
+        events = data.get("winningTicketRedeemedEvents", [])
+
+        # Aggregate by gateway -> orchestrator pairs
+        traffic: dict[str, dict] = {}
+        for e in events:
+            gateway = e["sender"]
+            orch = e["recipient"]
+            key = f"{gateway}:{orch}"
+
+            if key not in traffic:
+                traffic[key] = {
+                    "gateway": gateway,
+                    "orchestrator": orch,
+                    "ticket_count": 0,
+                    "total_eth": 0.0,
+                    "first_ticket": int(e["timestamp"]),
+                    "last_ticket": int(e["timestamp"])
+                }
+
+            traffic[key]["ticket_count"] += 1
+            traffic[key]["total_eth"] += int(e["faceValue"]) / 1e18
+            traffic[key]["first_ticket"] = min(traffic[key]["first_ticket"], int(e["timestamp"]))
+            traffic[key]["last_ticket"] = max(traffic[key]["last_ticket"], int(e["timestamp"]))
+
+        # Sort by total ETH (most active pairs first)
+        result = sorted(traffic.values(), key=lambda x: x["total_eth"], reverse=True)
+
+        return result
+
+    async def get_gateways_summary(self, hours: int = 24) -> list[dict]:
+        """
+        Get summary of all active gateways (broadcasters).
+
+        Shows each gateway's total traffic and which orchestrators they use.
+        """
+        traffic = await self.get_gateway_traffic(hours=hours)
+
+        # Aggregate by gateway
+        gateways: dict[str, dict] = {}
+        for t in traffic:
+            gw = t["gateway"]
+            if gw not in gateways:
+                gateways[gw] = {
+                    "gateway": gw,
+                    "total_tickets": 0,
+                    "total_eth": 0.0,
+                    "orchestrators": [],
+                    "orchestrator_count": 0
+                }
+
+            gateways[gw]["total_tickets"] += t["ticket_count"]
+            gateways[gw]["total_eth"] += t["total_eth"]
+            gateways[gw]["orchestrators"].append({
+                "address": t["orchestrator"],
+                "tickets": t["ticket_count"],
+                "eth": t["total_eth"]
+            })
+
+        # Calculate orchestrator counts and sort
+        for gw in gateways.values():
+            gw["orchestrator_count"] = len(gw["orchestrators"])
+            gw["orchestrators"] = sorted(gw["orchestrators"], key=lambda x: x["eth"], reverse=True)
+
+        return sorted(gateways.values(), key=lambda x: x["total_eth"], reverse=True)
+
+
 # Global instance
 _subgraph: Optional[LivepeerSubgraph] = None
 

@@ -352,6 +352,51 @@ def create_app() -> FastAPI:
             "recent_redemptions": [r.to_dict() for r in recent]
         }
 
+    @app.get("/api/v1/gateways")
+    async def get_gateways(
+        hours: int = Query(default=24, le=168)
+    ):
+        """
+        Get all active gateways (broadcasters) and their traffic distribution.
+
+        Shows which orchestrators each gateway is routing work to.
+        """
+        gateways = await _subgraph.get_gateways_summary(hours)
+
+        return {
+            "period_hours": hours,
+            "gateway_count": len(gateways),
+            "gateways": gateways
+        }
+
+    @app.get("/api/v1/gateways/{gateway_address}/traffic")
+    async def get_gateway_traffic(
+        gateway_address: str,
+        hours: int = Query(default=24, le=168)
+    ):
+        """
+        Get traffic breakdown for a specific gateway.
+
+        Shows which orchestrators this gateway sent work to and how much.
+        """
+        traffic = await _subgraph.get_gateway_traffic(
+            gateway_address=gateway_address,
+            hours=hours
+        )
+
+        # Calculate totals
+        total_tickets = sum(t["ticket_count"] for t in traffic)
+        total_eth = sum(t["total_eth"] for t in traffic)
+
+        return {
+            "gateway": gateway_address,
+            "period_hours": hours,
+            "total_tickets": total_tickets,
+            "total_eth": total_eth,
+            "orchestrator_count": len(traffic),
+            "traffic": traffic
+        }
+
     # ==================== Verification Endpoints ====================
 
     @app.post("/api/v1/nodes/register-endpoint")
@@ -694,6 +739,7 @@ def create_app() -> FastAPI:
                 Auto-refreshes every 30 seconds |
                 <a href="/api/v1/stats">Stats API</a> •
                 <a href="/api/v1/orchestrators/top100">Top 100 API</a> •
+                <a href="/api/v1/gateways">Gateways</a> •
                 <a href="/api/v1/network/redemptions">On-Chain Data</a> •
                 <a href="/docs">API Docs</a>
             </p>
