@@ -21,8 +21,17 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # Subgraph endpoints
-SUBGRAPH_FREE = "https://api.thegraph.com/subgraphs/name/livepeer/arbitrum-one"
-SUBGRAPH_GATEWAY = "https://gateway.thegraph.com/api/{api_key}/subgraphs/id/Pkp6kB2N3QrdoWkcXgAHxQW8x9xLhiKHUL84B2aYk9X8"
+# Note: The Graph's free hosted service was deprecated in 2024
+# The decentralized gateway requires an API key (get one at https://thegraph.com/studio/)
+#
+# Livepeer Subgraph on Arbitrum One:
+# - Explorer: https://thegraph.com/explorer/subgraphs/FE63YgkzcpVocxdCEyEYbvjYqEf2kb1A6daMYRxmejYC
+# - Docs: https://github.com/livepeer/subgraph
+SUBGRAPH_ID = "FE63YgkzcpVocxdCEyEYbvjYqEf2kb1A6daMYRxmejYC"
+SUBGRAPH_GATEWAY = f"https://gateway.thegraph.com/api/{{api_key}}/subgraphs/id/{SUBGRAPH_ID}"
+
+# Arbitrum Gateway (free tier with rate limits)
+SUBGRAPH_ARBITRUM = f"https://gateway-arbitrum.network.thegraph.com/api/{{api_key}}/subgraphs/id/{SUBGRAPH_ID}"
 
 
 @dataclass
@@ -61,20 +70,30 @@ class LivepeerSubgraph:
     """
     Client for querying the Livepeer subgraph.
 
-    Uses free tier by default, or gateway with API key for higher limits.
+    Requires a Graph API key (get one free at https://thegraph.com/studio/).
+    Set the GRAPH_API_KEY environment variable.
     """
 
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.environ.get("GRAPH_API_KEY")
+        self._enabled = bool(self.api_key)
 
         if self.api_key:
             self.endpoint = SUBGRAPH_GATEWAY.format(api_key=self.api_key)
-            logger.info("Using The Graph gateway (API key provided)")
+            logger.info("Using The Graph decentralized gateway")
         else:
-            self.endpoint = SUBGRAPH_FREE
-            logger.info("Using The Graph free tier (no API key)")
+            self.endpoint = None
+            logger.warning(
+                "GRAPH_API_KEY not set - on-chain data disabled. "
+                "Get a free API key at https://thegraph.com/studio/"
+            )
 
         self._client: Optional[httpx.AsyncClient] = None
+
+    @property
+    def enabled(self) -> bool:
+        """Returns True if subgraph queries are enabled (API key is set)."""
+        return self._enabled
 
     async def __aenter__(self):
         self._client = httpx.AsyncClient(timeout=30.0)
@@ -86,6 +105,10 @@ class LivepeerSubgraph:
 
     async def _query(self, query: str, variables: dict = None) -> dict:
         """Execute a GraphQL query."""
+        if not self._enabled:
+            logger.debug("Subgraph query skipped - no API key configured")
+            return {}
+
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=30.0)
 

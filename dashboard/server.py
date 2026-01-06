@@ -597,11 +597,14 @@ def create_app() -> FastAPI:
         orchestrators = await _livepeer.get_top_orchestrators(100)
         linked_count = sum(1 for o in orchestrators if _link_registry.get_node_id(o.eth_address))
 
-        # Get network-wide ticket redemption stats
-        try:
-            network_redemptions = await _subgraph.get_network_stats(hours=24)
-        except Exception:
-            network_redemptions = {"total_tickets": 0, "total_eth": 0.0, "active_orchestrators": 0}
+        # Get network-wide ticket redemption stats (requires GRAPH_API_KEY)
+        if _subgraph.enabled:
+            try:
+                network_redemptions = await _subgraph.get_network_stats(hours=24)
+            except Exception:
+                network_redemptions = {"total_tickets": 0, "total_eth": 0.0, "active_orchestrators": 0}
+        else:
+            network_redemptions = {"total_tickets": "N/A", "total_eth": "N/A", "active_orchestrators": 0, "disabled": True}
 
         # Build nodes table
         nodes_html = ""
@@ -677,11 +680,11 @@ def create_app() -> FastAPI:
                     <div class="stat-label">Online Agents</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-value">{network_redemptions['total_tickets']}</div>
+                    <div class="stat-value">{network_redemptions['total_tickets'] if not network_redemptions.get('disabled') else '<span title="Set GRAPH_API_KEY">N/A</span>'}</div>
                     <div class="stat-label">Tickets (24h)</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-value">{network_redemptions['total_eth']:.4f}</div>
+                    <div class="stat-value">{f"{network_redemptions['total_eth']:.4f}" if not network_redemptions.get('disabled') else '<span title="Set GRAPH_API_KEY">N/A</span>'}</div>
                     <div class="stat-label">ETH Earned (24h)</div>
                 </div>
                 <div class="stat-card">
