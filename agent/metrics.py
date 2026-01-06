@@ -1,8 +1,8 @@
 """
 Job-level metrics collection.
 
-Captures real-time performance data from transcoding and AI jobs,
-similar to what the Cloud SPE proposal describes but simpler.
+Captures real-time performance data from transcoding jobs.
+Focused on transcode metrics and SLA scores.
 """
 from __future__ import annotations
 
@@ -20,8 +20,6 @@ logger = logging.getLogger(__name__)
 
 class JobType(str, Enum):
     TRANSCODE = "transcode"
-    AI_INFERENCE = "ai_inference"
-    AI_BATCH = "ai_batch"
 
 
 @dataclass
@@ -62,44 +60,6 @@ class TranscodeMetrics:
 
 
 @dataclass
-class AIInferenceMetrics:
-    """Metrics from an AI inference job."""
-    job_id: str
-    timestamp: int
-
-    # Model info
-    model_name: str
-    model_type: str        # e.g., "llm", "image", "video", "audio"
-
-    # Input
-    input_tokens: Optional[int] = None     # For LLMs
-    input_frames: Optional[int] = None     # For video
-    input_size_bytes: Optional[int] = None
-
-    # Output
-    output_tokens: Optional[int] = None
-    output_frames: Optional[int] = None
-    output_size_bytes: Optional[int] = None
-
-    # Performance
-    inference_time_ms: int = 0
-    tokens_per_second: Optional[float] = None
-    frames_per_second: Optional[float] = None
-    time_to_first_token_ms: Optional[int] = None  # For streaming LLMs
-
-    # Resource usage
-    gpu_memory_used_mb: Optional[int] = None
-    gpu_utilization_percent: Optional[float] = None
-
-    # Errors
-    success: bool = True
-    error_message: Optional[str] = None
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
 class SLAScore:
     """
     Computed SLA score for a node.
@@ -129,7 +89,7 @@ class SLAScore:
 
 class MetricsCollector:
     """
-    Collects and aggregates job metrics.
+    Collects and aggregates transcode job metrics.
 
     This runs on the agent and reports metrics with each heartbeat.
     """
@@ -137,7 +97,6 @@ class MetricsCollector:
     def __init__(self, max_history: int = 1000):
         self.max_history = max_history
         self._transcode_metrics: list[TranscodeMetrics] = []
-        self._ai_metrics: list[AIInferenceMetrics] = []
         self._start_time = time.time()
 
     def record_transcode(self, metrics: TranscodeMetrics):
@@ -146,27 +105,16 @@ class MetricsCollector:
         if len(self._transcode_metrics) > self.max_history:
             self._transcode_metrics = self._transcode_metrics[-self.max_history:]
 
-    def record_ai_inference(self, metrics: AIInferenceMetrics):
-        """Record an AI inference job's metrics."""
-        self._ai_metrics.append(metrics)
-        if len(self._ai_metrics) > self.max_history:
-            self._ai_metrics = self._ai_metrics[-self.max_history:]
-
     def get_summary(self, last_n_minutes: int = 60) -> dict:
         """Get aggregated metrics summary for reporting."""
         cutoff = time.time() - (last_n_minutes * 60)
-
         recent_transcode = [m for m in self._transcode_metrics if m.timestamp > cutoff]
-        recent_ai = [m for m in self._ai_metrics if m.timestamp > cutoff]
 
-        summary = {
+        return {
             "period_minutes": last_n_minutes,
             "uptime_seconds": int(time.time() - self._start_time),
-            "transcode": self._summarize_transcode(recent_transcode),
-            "ai_inference": self._summarize_ai(recent_ai)
+            "transcode": self._summarize_transcode(recent_transcode)
         }
-
-        return summary
 
     def _summarize_transcode(self, metrics: list[TranscodeMetrics]) -> dict:
         """Summarize transcode metrics."""
@@ -184,23 +132,6 @@ class MetricsCollector:
             "avg_realtime_ratio": sum(ratios) / len(ratios) if ratios else 0,
             "min_realtime_ratio": min(ratios) if ratios else 0,
             "gpu_job_percent": sum(1 for m in metrics if m.gpu_used) / len(metrics) if metrics else 0
-        }
-
-    def _summarize_ai(self, metrics: list[AIInferenceMetrics]) -> dict:
-        """Summarize AI inference metrics."""
-        if not metrics:
-            return {"job_count": 0}
-
-        success_count = sum(1 for m in metrics if m.success)
-        times = [m.inference_time_ms for m in metrics if m.success]
-        tps = [m.tokens_per_second for m in metrics if m.tokens_per_second]
-
-        return {
-            "job_count": len(metrics),
-            "success_rate": success_count / len(metrics) if metrics else 0,
-            "avg_inference_ms": sum(times) / len(times) if times else 0,
-            "avg_tokens_per_second": sum(tps) / len(tps) if tps else None,
-            "model_types": list(set(m.model_type for m in metrics))
         }
 
 

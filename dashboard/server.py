@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from agent.identity import NodeIdentity, SignedAttestation
 from agent.livepeer import get_livepeer_network, LivepeerNetwork
 from agent.eth_link import AddressLink, AddressLinkRegistry, verify_address_link, create_link_for_signing
+from agent.onchain import get_subgraph, LivepeerSubgraph
 from .models import AttestationPayload
 from .storage import get_storage, Storage
 from .verifier import get_verifier, Verifier
@@ -56,6 +57,7 @@ _livepeer: Optional[LivepeerNetwork] = None
 _link_registry: Optional[AddressLinkRegistry] = None
 _proof_generator: Optional[ProofGenerator] = None
 _proof_storage: Optional[ProofStorage] = None
+_subgraph: Optional[LivepeerSubgraph] = None
 
 
 def create_app() -> FastAPI:
@@ -63,16 +65,19 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        global _storage, _verifier, _livepeer, _link_registry, _proof_generator, _proof_storage
+        global _storage, _verifier, _livepeer, _link_registry, _proof_generator, _proof_storage, _subgraph
         _storage = get_storage()
         _verifier = get_verifier()
         _livepeer = get_livepeer_network()
         _link_registry = AddressLinkRegistry()
         _proof_generator = get_proof_generator()
         _proof_storage = get_proof_storage()
+        _subgraph = get_subgraph()
         await _verifier.__aenter__()
+        await _subgraph.__aenter__()
         logger.info("Dashboard started")
         yield
+        await _subgraph.__aexit__(None, None, None)
         await _verifier.__aexit__(None, None, None)
         logger.info("Dashboard stopped")
 
@@ -272,6 +277,79 @@ def create_app() -> FastAPI:
                 "verified": verified_count
             },
             "orchestrators": result
+        }
+
+    # ==================== On-Chain Ticket Redemptions ====================
+
+    @app.get("/api/v1/orchestrators/{eth_address}/tickets")
+    async def get_orchestrator_tickets(
+        eth_address: str,
+        limit: int = Query(default=50, le=100),
+        days: int = Query(default=30, le=90)
+    ):
+        """
+        Get on-chain ticket redemptions for an orchestrator.
+
+        Tickets represent verifiable proof of work - each winning ticket
+        is a micropayment from a broadcaster for transcoding work done.
+        """
+        from datetime import datetime, timedelta
+
+        since_timestamp = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+
+        redemptions = await _subgraph.get_ticket_redemptions(
+            orchestrator_address=eth_address,
+            limit=limit,
+            since_timestamp=since_timestamp
+        )
+
+        return {
+            "eth_address": eth_address,
+            "period_days": days,
+            "ticket_count": len(redemptions),
+            "tickets": [r.to_dict() for r in redemptions]
+        }
+
+    @app.get("/api/v1/orchestrators/{eth_address}/earnings")
+    async def get_orchestrator_earnings(
+        eth_address: str,
+        days: int = Query(default=30, le=365)
+    ):
+        """
+        Get earnings summary for an orchestrator from ticket redemptions.
+
+        This is on-chain verifiable proof of work performed.
+        """
+        earnings = await _subgraph.get_orchestrator_earnings(eth_address, days)
+
+        # Check if top 100
+        is_top, rank = await _livepeer.is_top_orchestrator(eth_address)
+
+        # Get daily breakdown
+        daily_activity = await _subgraph.get_orchestrator_activity(eth_address, min(days, 30))
+
+        return {
+            **earnings.to_dict(),
+            "is_top_100": is_top,
+            "rank": rank,
+            "daily_activity": daily_activity
+        }
+
+    @app.get("/api/v1/network/redemptions")
+    async def get_network_redemptions(
+        hours: int = Query(default=24, le=168)
+    ):
+        """
+        Get network-wide ticket redemption statistics.
+
+        Shows overall network activity and active orchestrators/broadcasters.
+        """
+        stats = await _subgraph.get_network_stats(hours)
+        recent = await _subgraph.get_recent_network_redemptions(limit=20)
+
+        return {
+            **stats,
+            "recent_redemptions": [r.to_dict() for r in recent]
         }
 
     # ==================== Verification Endpoints ====================
@@ -474,6 +552,12 @@ def create_app() -> FastAPI:
         orchestrators = await _livepeer.get_top_orchestrators(100)
         linked_count = sum(1 for o in orchestrators if _link_registry.get_node_id(o.eth_address))
 
+        # Get network-wide ticket redemption stats
+        try:
+            network_redemptions = await _subgraph.get_network_stats(hours=24)
+        except Exception:
+            network_redemptions = {"total_tickets": 0, "total_eth": 0.0, "active_orchestrators": 0}
+
         # Build nodes table
         nodes_html = ""
         for n in sorted(nodes, key=lambda x: x.last_seen, reverse=True)[:20]:
@@ -548,12 +632,16 @@ def create_app() -> FastAPI:
                     <div class="stat-label">Online Agents</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-value">{stats['total_gpus']}</div>
-                    <div class="stat-label">Total GPUs</div>
+                    <div class="stat-value">{network_redemptions['total_tickets']}</div>
+                    <div class="stat-label">Tickets (24h)</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-value">{stats['total_memory_gb']:.0f} GB</div>
-                    <div class="stat-label">Total Memory</div>
+                    <div class="stat-value">{network_redemptions['total_eth']:.4f}</div>
+                    <div class="stat-label">ETH Earned (24h)</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{stats['total_gpus']}</div>
+                    <div class="stat-label">Total GPUs</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-value">{stats['total_attestations']}</div>
@@ -606,6 +694,7 @@ def create_app() -> FastAPI:
                 Auto-refreshes every 30 seconds |
                 <a href="/api/v1/stats">Stats API</a> •
                 <a href="/api/v1/orchestrators/top100">Top 100 API</a> •
+                <a href="/api/v1/network/redemptions">On-Chain Data</a> •
                 <a href="/docs">API Docs</a>
             </p>
         </body>
