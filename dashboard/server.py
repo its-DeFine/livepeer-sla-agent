@@ -285,27 +285,24 @@ def create_app() -> FastAPI:
     async def get_orchestrator_tickets(
         eth_address: str,
         limit: int = Query(default=50, le=100),
-        days: int = Query(default=30, le=90)
+        hours: int = Query(default=6, le=24, description="Hours to look back (max 24 due to RPC limits)")
     ):
         """
         Get on-chain ticket redemptions for an orchestrator.
 
         Tickets represent verifiable proof of work - each winning ticket
         is a micropayment from a broadcaster for transcoding work done.
+
+        Note: Uses direct RPC queries, limited to ~24 hours on public RPC.
         """
-        from datetime import datetime, timedelta
-
-        since_timestamp = int((datetime.utcnow() - timedelta(days=days)).timestamp())
-
         redemptions = await _subgraph.get_ticket_redemptions(
             orchestrator_address=eth_address,
-            limit=limit,
-            since_timestamp=since_timestamp
+            limit=limit
         )
 
         return {
             "eth_address": eth_address,
-            "period_days": days,
+            "period_hours": hours,
             "ticket_count": len(redemptions),
             "tickets": [r.to_dict() for r in redemptions]
         }
@@ -313,12 +310,13 @@ def create_app() -> FastAPI:
     @app.get("/api/v1/orchestrators/{eth_address}/earnings")
     async def get_orchestrator_earnings(
         eth_address: str,
-        days: int = Query(default=30, le=365)
+        days: int = Query(default=1, le=7, description="Days to look back (max 7 due to RPC limits)")
     ):
         """
         Get earnings summary for an orchestrator from ticket redemptions.
 
         This is on-chain verifiable proof of work performed.
+        Note: Uses direct RPC queries, limited lookback on public RPC.
         """
         earnings = await _subgraph.get_orchestrator_earnings(eth_address, days)
 
@@ -326,7 +324,7 @@ def create_app() -> FastAPI:
         is_top, rank = await _livepeer.is_top_orchestrator(eth_address)
 
         # Get daily breakdown
-        daily_activity = await _subgraph.get_orchestrator_activity(eth_address, min(days, 30))
+        daily_activity = await _subgraph.get_orchestrator_activity(eth_address, min(days, 2))
 
         return {
             **earnings.to_dict(),
@@ -337,12 +335,13 @@ def create_app() -> FastAPI:
 
     @app.get("/api/v1/network/redemptions")
     async def get_network_redemptions(
-        hours: int = Query(default=24, le=168)
+        hours: int = Query(default=6, le=24, description="Hours to look back (max 24 due to RPC limits)")
     ):
         """
         Get network-wide ticket redemption statistics.
 
-        Shows overall network activity and active orchestrators/broadcasters.
+        Shows overall network activity and active orchestrators/gateways.
+        Note: Uses direct RPC queries to Arbitrum One.
         """
         stats = await _subgraph.get_network_stats(hours)
         recent = await _subgraph.get_recent_network_redemptions(limit=20)
@@ -354,12 +353,13 @@ def create_app() -> FastAPI:
 
     @app.get("/api/v1/gateways")
     async def get_gateways(
-        hours: int = Query(default=24, le=168)
+        hours: int = Query(default=6, le=24, description="Hours to look back (max 24 due to RPC limits)")
     ):
         """
         Get all active gateways (broadcasters) and their traffic distribution.
 
         Shows which orchestrators each gateway is routing work to.
+        Note: Uses direct RPC queries to Arbitrum One.
         """
         gateways = await _subgraph.get_gateways_summary(hours)
 
@@ -372,12 +372,13 @@ def create_app() -> FastAPI:
     @app.get("/api/v1/gateways/{gateway_address}/traffic")
     async def get_gateway_traffic(
         gateway_address: str,
-        hours: int = Query(default=24, le=168)
+        hours: int = Query(default=6, le=24, description="Hours to look back (max 24 due to RPC limits)")
     ):
         """
         Get traffic breakdown for a specific gateway.
 
         Shows which orchestrators this gateway sent work to and how much.
+        Note: Uses direct RPC queries to Arbitrum One.
         """
         traffic = await _subgraph.get_gateway_traffic(
             gateway_address=gateway_address,
@@ -589,163 +590,625 @@ def create_app() -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard_ui():
-        """Dashboard UI with top 100 orchestrator status."""
+        """Dashboard UI with visual observability for Livepeer network."""
         stats = _storage.get_network_stats()
         nodes = _storage.get_all_nodes()
 
         # Get top 100 data
         orchestrators = await _livepeer.get_top_orchestrators(100)
         linked_count = sum(1 for o in orchestrators if _link_registry.get_node_id(o.eth_address))
+        online_count = sum(1 for o in orchestrators if _link_registry.get_node_id(o.eth_address) and _storage.get_node(_link_registry.get_node_id(o.eth_address)) and _storage.get_node(_link_registry.get_node_id(o.eth_address)).is_online)
 
-        # Get network-wide ticket redemption stats (requires GRAPH_API_KEY)
-        if _subgraph.enabled:
-            try:
-                network_redemptions = await _subgraph.get_network_stats(hours=24)
-            except Exception:
-                network_redemptions = {"total_tickets": 0, "total_eth": 0.0, "active_orchestrators": 0}
-        else:
-            network_redemptions = {"total_tickets": "N/A", "total_eth": "N/A", "active_orchestrators": 0, "disabled": True}
+        # Get network-wide ticket redemption stats
+        try:
+            network_redemptions = await _subgraph.get_network_stats(hours=6)
+        except Exception as e:
+            logger.warning(f"Failed to fetch network stats: {e}")
+            network_redemptions = {"total_tickets": 0, "total_eth": 0.0, "active_orchestrators": 0, "active_gateways": 0}
 
-        # Build nodes table
-        nodes_html = ""
-        for n in sorted(nodes, key=lambda x: x.last_seen, reverse=True)[:20]:
-            status_badge = "🟢" if n.is_online else "🔴"
-            eth_addr = _link_registry.get_eth_address(n.node_id)
-            eth_display = f"{eth_addr[:10]}..." if eth_addr else "Not linked"
-            caps = _summarize_capabilities(n.last_capabilities)
-            nodes_html += f"""
-            <tr>
-                <td><code>{n.node_id[:16]}...</code></td>
-                <td><code style="color:#f0883e;">{eth_display}</code></td>
-                <td>{status_badge}</td>
-                <td>{n.attestation_count}</td>
-                <td>{n.verification_score:.1f}</td>
-                <td>{caps.get('gpus', 'N/A')}</td>
-                <td>{n.last_seen.strftime('%H:%M:%S')}</td>
-            </tr>
+        # Get gateway traffic data
+        try:
+            gateways = await _subgraph.get_gateways_summary(hours=6)
+        except Exception as e:
+            logger.warning(f"Failed to fetch gateway data: {e}")
+            gateways = []
+
+        # Get recent redemptions for chart
+        try:
+            recent_redemptions = await _subgraph.get_recent_network_redemptions(limit=100)
+        except Exception:
+            recent_redemptions = []
+
+        # Build hourly earnings data for chart
+        from collections import defaultdict
+        hourly_earnings = defaultdict(float)
+        for r in recent_redemptions:
+            if r.timestamp > 0:
+                hour_key = datetime.utcfromtimestamp(r.timestamp).strftime("%H:00")
+                hourly_earnings[hour_key] += r.face_value_eth
+
+        # Sort by hour
+        sorted_hours = sorted(hourly_earnings.keys())
+        chart_labels = sorted_hours[-6:] if len(sorted_hours) > 6 else sorted_hours
+        chart_data = [hourly_earnings[h] for h in chart_labels]
+
+        # Build gateway traffic bars
+        max_tickets = max((g["total_tickets"] for g in gateways), default=1)
+        gateways_html = ""
+        for gw in gateways[:6]:
+            bar_width = int((gw["total_tickets"] / max_tickets) * 100)
+            gateways_html += f"""
+            <div class="traffic-row">
+                <a href="/gateway/{gw['gateway']}" class="gateway-addr">{gw['gateway'][:10]}...{gw['gateway'][-4:]}</a>
+                <div class="traffic-bar-container">
+                    <div class="traffic-bar" style="width: {bar_width}%"></div>
+                </div>
+                <span class="traffic-stats">{gw['total_tickets']} tickets • {gw['total_eth']:.4f} ETH • {gw['orchestrator_count']} orchs</span>
+            </div>
             """
 
-        # Build top 100 table
+        # Build orchestrator table with progress bars
         top100_html = ""
-        for orch in orchestrators[:20]:
+        for orch in orchestrators[:15]:
             node_id = _link_registry.get_node_id(orch.eth_address)
             node = _storage.get_node(node_id) if node_id else None
-            status = "🟢" if (node and node.is_online) else ("🟡" if node_id else "⚪")
-            link_status = "✓ Linked" if node_id else "Not linked"
+
+            if node and node.is_online:
+                status = '<span class="status-badge online">● Online</span>'
+            elif node_id:
+                status = '<span class="status-badge linked">● Linked</span>'
+            else:
+                status = '<span class="status-badge">○ Not linked</span>'
+
             stake = f"{orch.total_stake / 1000:.1f}k" if orch.total_stake >= 1000 else f"{orch.total_stake:.0f}"
+            score = node.verification_score if node else 0
+            score_width = int(score)
 
             top100_html += f"""
-            <tr>
+            <tr onclick="window.location='/orchestrator/{orch.eth_address}'" style="cursor:pointer;">
                 <td><strong>#{orch.rank}</strong></td>
-                <td><code>{orch.eth_address[:14]}...</code></td>
+                <td><code class="eth-addr">{orch.eth_address[:8]}...{orch.eth_address[-6:]}</code></td>
                 <td>{stake} LPT</td>
-                <td>{status} {link_status}</td>
-                <td>{node.verification_score:.1f if node else '-'}</td>
+                <td>{status}</td>
+                <td>
+                    <div class="score-bar-container">
+                        <div class="score-bar" style="width: {score_width}%"></div>
+                        <span class="score-text">{score:.0f}</span>
+                    </div>
+                </td>
             </tr>
             """
+
+        # Network health summary with GPU metrics
+        gpu_util = stats.get('avg_gpu_utilization', 0)
+        gpu_temp = stats.get('avg_gpu_temperature', 0)
+        gpu_power = stats.get('total_power_draw_w', 0)
+        gpus_reporting = stats.get('gpus_reporting_metrics', 0)
+
+        # Color code temperature (green < 70, yellow < 85, red >= 85)
+        temp_color = "#3fb950" if gpu_temp < 70 else ("#d29922" if gpu_temp < 85 else "#f85149")
+
+        health_html = f"""
+            <div class="health-item">
+                <span class="health-label">SLA Coverage</span>
+                <span class="health-value">{linked_count}/100 orchestrators linked</span>
+            </div>
+            <div class="health-item">
+                <span class="health-label">Online Agents</span>
+                <span class="health-value">{online_count} reporting</span>
+            </div>
+            <div class="health-item">
+                <span class="health-label">Total GPUs</span>
+                <span class="health-value">{stats['total_gpus']} available</span>
+            </div>
+            <div class="health-item">
+                <span class="health-label">GPU Utilization</span>
+                <span class="health-value">{gpu_util:.1f}% avg ({gpus_reporting} reporting)</span>
+            </div>
+            <div class="health-item">
+                <span class="health-label">GPU Temperature</span>
+                <span class="health-value" style="color: {temp_color}">{gpu_temp:.1f}°C avg</span>
+            </div>
+            <div class="health-item">
+                <span class="health-label">Power Draw</span>
+                <span class="health-value">{gpu_power:.0f}W total</span>
+            </div>
+            <div class="health-item">
+                <span class="health-label">Attestations</span>
+                <span class="health-value">{stats['total_attestations']} total</span>
+            </div>
+        """
 
         return f"""
         <!DOCTYPE html>
         <html>
         <head>
             <title>Livepeer SLA Dashboard</title>
+            <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
             <style>
-                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #0d1117; color: #c9d1d9; }}
-                h1, h2 {{ color: #58a6ff; }}
-                .stats {{ display: flex; gap: 20px; margin-bottom: 30px; flex-wrap: wrap; }}
-                .stat-card {{ background: #161b22; padding: 20px; border-radius: 8px; border: 1px solid #30363d; min-width: 120px; }}
-                .stat-value {{ font-size: 28px; font-weight: bold; color: #58a6ff; }}
-                .stat-label {{ color: #8b949e; font-size: 13px; }}
-                .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 30px; }}
-                table {{ width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }}
-                th, td {{ padding: 10px 14px; text-align: left; border-bottom: 1px solid #30363d; font-size: 13px; }}
-                th {{ background: #21262d; color: #8b949e; font-weight: 600; }}
-                code {{ background: #30363d; padding: 2px 6px; border-radius: 4px; font-size: 11px; }}
-                .refresh {{ color: #8b949e; font-size: 12px; margin-top: 20px; }}
-                a {{ color: #58a6ff; }}
-                .highlight {{ background: #238636; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px; }}
+                * {{ box-sizing: border-box; }}
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    margin: 0; padding: 24px 32px;
+                    background: #0d1117; color: #c9d1d9;
+                    line-height: 1.5;
+                }}
+                h1 {{ color: #fff; margin: 0 0 24px 0; font-size: 24px; font-weight: 600; }}
+                h2 {{ color: #c9d1d9; margin: 0 0 16px 0; font-size: 16px; font-weight: 600; }}
+                h3 {{ color: #8b949e; margin: 0 0 12px 0; font-size: 13px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }}
+                a {{ color: #58a6ff; text-decoration: none; }}
+                a:hover {{ text-decoration: underline; }}
+
+                /* Hero Stats */
+                .hero-stats {{
+                    display: grid;
+                    grid-template-columns: repeat(4, 1fr);
+                    gap: 16px;
+                    margin-bottom: 24px;
+                }}
+                .hero-card {{
+                    background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
+                    border: 1px solid #30363d;
+                    border-radius: 12px;
+                    padding: 20px;
+                }}
+                .hero-card.primary {{ border-color: #58a6ff; }}
+                .hero-icon {{ font-size: 20px; margin-bottom: 8px; }}
+                .hero-value {{ font-size: 32px; font-weight: 700; color: #fff; margin-bottom: 4px; }}
+                .hero-label {{ font-size: 13px; color: #8b949e; }}
+                .hero-sublabel {{ font-size: 11px; color: #6e7681; margin-top: 4px; }}
+
+                /* Main Grid */
+                .main-grid {{
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 24px;
+                    margin-bottom: 24px;
+                }}
+                .panel {{
+                    background: #161b22;
+                    border: 1px solid #30363d;
+                    border-radius: 12px;
+                    padding: 20px;
+                }}
+
+                /* Traffic Flow */
+                .traffic-row {{
+                    display: flex;
+                    align-items: center;
+                    gap: 12px;
+                    margin-bottom: 12px;
+                }}
+                .gateway-addr {{
+                    font-family: 'SF Mono', Monaco, monospace;
+                    font-size: 12px;
+                    color: #f0883e;
+                    min-width: 140px;
+                }}
+                .traffic-bar-container {{
+                    flex: 1;
+                    height: 24px;
+                    background: #21262d;
+                    border-radius: 4px;
+                    overflow: hidden;
+                }}
+                .traffic-bar {{
+                    height: 100%;
+                    background: linear-gradient(90deg, #238636 0%, #3fb950 100%);
+                    border-radius: 4px;
+                    transition: width 0.3s ease;
+                }}
+                .traffic-stats {{
+                    font-size: 11px;
+                    color: #8b949e;
+                    min-width: 180px;
+                    text-align: right;
+                }}
+
+                /* Chart */
+                .chart-container {{
+                    height: 200px;
+                    position: relative;
+                }}
+
+                /* Table */
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                }}
+                th, td {{
+                    padding: 10px 12px;
+                    text-align: left;
+                    border-bottom: 1px solid #21262d;
+                    font-size: 13px;
+                }}
+                th {{
+                    color: #8b949e;
+                    font-weight: 500;
+                    font-size: 11px;
+                    text-transform: uppercase;
+                    letter-spacing: 0.5px;
+                }}
+                tr:hover {{ background: #1c2128; }}
+                code {{ font-family: 'SF Mono', Monaco, monospace; }}
+                .eth-addr {{
+                    background: #30363d;
+                    padding: 2px 6px;
+                    border-radius: 4px;
+                    font-size: 11px;
+                    color: #f0883e;
+                }}
+
+                /* Status Badges */
+                .status-badge {{
+                    font-size: 11px;
+                    padding: 2px 8px;
+                    border-radius: 12px;
+                    background: #30363d;
+                    color: #8b949e;
+                }}
+                .status-badge.online {{
+                    background: rgba(35, 134, 54, 0.2);
+                    color: #3fb950;
+                }}
+                .status-badge.linked {{
+                    background: rgba(210, 153, 34, 0.2);
+                    color: #d29922;
+                }}
+
+                /* Score Bar */
+                .score-bar-container {{
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                }}
+                .score-bar {{
+                    height: 6px;
+                    background: #3fb950;
+                    border-radius: 3px;
+                    min-width: 4px;
+                }}
+                .score-text {{
+                    font-size: 11px;
+                    color: #8b949e;
+                    min-width: 24px;
+                }}
+
+                /* Health Panel */
+                .health-item {{
+                    display: flex;
+                    justify-content: space-between;
+                    padding: 8px 0;
+                    border-bottom: 1px solid #21262d;
+                }}
+                .health-item:last-child {{ border-bottom: none; }}
+                .health-label {{ color: #8b949e; font-size: 13px; }}
+                .health-value {{ color: #c9d1d9; font-size: 13px; font-weight: 500; }}
+
+                /* Footer */
+                .footer {{
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    padding-top: 16px;
+                    border-top: 1px solid #21262d;
+                    font-size: 12px;
+                    color: #6e7681;
+                }}
+                .footer-links {{ display: flex; gap: 16px; }}
+
+                /* Responsive */
+                @media (max-width: 1200px) {{
+                    .hero-stats {{ grid-template-columns: repeat(2, 1fr); }}
+                    .main-grid {{ grid-template-columns: 1fr; }}
+                }}
             </style>
             <meta http-equiv="refresh" content="30">
         </head>
         <body>
-            <h1>🎬 Livepeer SLA Dashboard</h1>
+            <h1>🎬 Livepeer Network Observatory</h1>
 
-            <div class="stats">
-                <div class="stat-card">
-                    <div class="stat-value">{linked_count}/{len(orchestrators)}</div>
-                    <div class="stat-label">Top 100 Linked</div>
+            <!-- Hero Stats -->
+            <div class="hero-stats">
+                <div class="hero-card primary">
+                    <div class="hero-icon">🎫</div>
+                    <div class="hero-value">{network_redemptions['total_tickets']}</div>
+                    <div class="hero-label">Tickets Redeemed</div>
+                    <div class="hero-sublabel">Last 6 hours</div>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-value">{stats['online_nodes']}</div>
-                    <div class="stat-label">Online Agents</div>
+                <div class="hero-card">
+                    <div class="hero-icon">💰</div>
+                    <div class="hero-value">{network_redemptions['total_eth']:.4f}</div>
+                    <div class="hero-label">ETH Earned</div>
+                    <div class="hero-sublabel">Last 6 hours</div>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-value">{network_redemptions['total_tickets'] if not network_redemptions.get('disabled') else '<span title="Set GRAPH_API_KEY">N/A</span>'}</div>
-                    <div class="stat-label">Tickets (24h)</div>
+                <div class="hero-card">
+                    <div class="hero-icon">🎯</div>
+                    <div class="hero-value">{network_redemptions.get('active_orchestrators', 0)}</div>
+                    <div class="hero-label">Active Orchestrators</div>
+                    <div class="hero-sublabel">Receiving work</div>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-value">{f"{network_redemptions['total_eth']:.4f}" if not network_redemptions.get('disabled') else '<span title="Set GRAPH_API_KEY">N/A</span>'}</div>
-                    <div class="stat-label">ETH Earned (24h)</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">{stats['total_gpus']}</div>
-                    <div class="stat-label">Total GPUs</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">{stats['total_attestations']}</div>
-                    <div class="stat-label">Attestations</div>
+                <div class="hero-card">
+                    <div class="hero-icon">🌐</div>
+                    <div class="hero-value">{network_redemptions.get('active_gateways', 0)}</div>
+                    <div class="hero-label">Active Gateways</div>
+                    <div class="hero-sublabel">Sending work</div>
                 </div>
             </div>
 
-            <div class="grid">
-                <div>
-                    <h2>📊 Top 100 Orchestrators</h2>
+            <!-- Main Grid -->
+            <div class="main-grid">
+                <!-- Gateway Traffic -->
+                <div class="panel">
+                    <h3>Gateway → Orchestrator Traffic</h3>
+                    {gateways_html if gateways_html else '<p style="color:#8b949e;text-align:center;padding:20px;">No gateway traffic in last 6 hours</p>'}
+                </div>
+
+                <!-- Earnings Chart -->
+                <div class="panel">
+                    <h3>Earnings Trend (Last 6 Hours)</h3>
+                    <div class="chart-container">
+                        <canvas id="earningsChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <div class="main-grid">
+                <!-- Top Orchestrators -->
+                <div class="panel">
+                    <h3>Top Orchestrators</h3>
                     <table>
                         <thead>
                             <tr>
                                 <th>Rank</th>
-                                <th>ETH Address</th>
+                                <th>Address</th>
                                 <th>Stake</th>
-                                <th>SLA Status</th>
-                                <th>Score</th>
+                                <th>Status</th>
+                                <th style="width:100px;">Score</th>
                             </tr>
                         </thead>
                         <tbody>
-                            {top100_html if top100_html else '<tr><td colspan="5" style="text-align:center;color:#8b949e;">Loading orchestrators...</td></tr>'}
+                            {top100_html if top100_html else '<tr><td colspan="5" style="text-align:center;color:#8b949e;padding:20px;">Loading...</td></tr>'}
                         </tbody>
                     </table>
-                    <p style="color:#8b949e;font-size:12px;">Showing top 20 • <a href="/api/v1/orchestrators/top100">View all 100 →</a></p>
+                    <p style="color:#6e7681;font-size:11px;margin-top:12px;text-align:center;">
+                        Showing top 15 • <a href="/api/v1/orchestrators/top100">View all 100 →</a>
+                    </p>
                 </div>
 
-                <div>
-                    <h2>🖥️ Connected Agents</h2>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Node ID</th>
-                                <th>ETH Address</th>
-                                <th>Status</th>
-                                <th>Atts</th>
-                                <th>Score</th>
-                                <th>GPUs</th>
-                                <th>Last Seen</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {nodes_html if nodes_html else '<tr><td colspan="7" style="text-align:center;color:#8b949e;">No agents registered yet</td></tr>'}
-                        </tbody>
-                    </table>
+                <!-- Network Health -->
+                <div class="panel">
+                    <h3>Network Health</h3>
+                    {health_html}
                 </div>
             </div>
 
-            <p class="refresh">
-                Auto-refreshes every 30 seconds |
-                <a href="/api/v1/stats">Stats API</a> •
-                <a href="/api/v1/orchestrators/top100">Top 100 API</a> •
-                <a href="/api/v1/gateways">Gateways</a> •
-                <a href="/api/v1/network/redemptions">On-Chain Data</a> •
-                <a href="/docs">API Docs</a>
-            </p>
+            <!-- Footer -->
+            <div class="footer">
+                <span>Auto-refreshes every 30 seconds • Data from Arbitrum One</span>
+                <div class="footer-links">
+                    <a href="/api/v1/gateways">Gateways API</a>
+                    <a href="/api/v1/network/redemptions">On-Chain API</a>
+                    <a href="/docs">API Docs</a>
+                </div>
+            </div>
+
+            <script>
+                // Chart.js config for dark theme
+                Chart.defaults.color = '#8b949e';
+                Chart.defaults.borderColor = '#30363d';
+
+                const ctx = document.getElementById('earningsChart').getContext('2d');
+                new Chart(ctx, {{
+                    type: 'line',
+                    data: {{
+                        labels: {chart_labels},
+                        datasets: [{{
+                            label: 'ETH Earned',
+                            data: {chart_data},
+                            borderColor: '#3fb950',
+                            backgroundColor: 'rgba(63, 185, 80, 0.1)',
+                            fill: true,
+                            tension: 0.4,
+                            pointRadius: 4,
+                            pointBackgroundColor: '#3fb950'
+                        }}]
+                    }},
+                    options: {{
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {{
+                            legend: {{ display: false }}
+                        }},
+                        scales: {{
+                            y: {{
+                                beginAtZero: true,
+                                grid: {{ color: '#21262d' }},
+                                ticks: {{
+                                    callback: function(value) {{ return value.toFixed(3) + ' ETH'; }}
+                                }}
+                            }},
+                            x: {{
+                                grid: {{ display: false }}
+                            }}
+                        }}
+                    }}
+                }});
+            </script>
+        </body>
+        </html>
+        """
+
+    # ==================== Detail Pages ====================
+
+    @app.get("/orchestrator/{eth_address}", response_class=HTMLResponse)
+    async def orchestrator_detail_page(eth_address: str):
+        """Detail page for a specific orchestrator."""
+        # Get orchestrator rank and stake
+        orchestrators = await _livepeer.get_top_orchestrators(100)
+        orch_data = next((o for o in orchestrators if o.eth_address.lower() == eth_address.lower()), None)
+
+        # Get node info if linked
+        node_id = _link_registry.get_node_id(eth_address)
+        node = _storage.get_node(node_id) if node_id else None
+
+        # Get earnings and tickets
+        try:
+            earnings = await _subgraph.get_orchestrator_earnings(eth_address, days=1)
+            tickets = await _subgraph.get_ticket_redemptions(orchestrator_address=eth_address, limit=20)
+        except Exception as e:
+            logger.warning(f"Failed to fetch orchestrator data: {e}")
+            earnings = None
+            tickets = []
+
+        # Build tickets table
+        tickets_html = ""
+        for t in tickets:
+            time_ago = _format_time_ago(t.timestamp) if t.timestamp > 0 else "Unknown"
+            tx_link = f"https://arbiscan.io/tx/{t.tx_hash}" if t.tx_hash else "#"
+            tickets_html += f"""
+            <tr>
+                <td>{time_ago}</td>
+                <td><a href="/gateway/{t.sender}" class="eth-addr">{t.sender[:8]}...{t.sender[-6:]}</a></td>
+                <td>{t.face_value_eth:.6f} ETH</td>
+                <td><a href="{tx_link}" target="_blank" style="font-size:11px;">View →</a></td>
+            </tr>
+            """
+
+        rank_display = f"Rank #{orch_data.rank}" if orch_data else "Unranked"
+        stake_display = f"{orch_data.total_stake / 1000:.1f}k LPT" if orch_data else "N/A"
+        status = "🟢 Online" if (node and node.is_online) else ("🟡 Linked" if node_id else "⚪ Not linked")
+        score = f"{node.verification_score:.0f}/100" if node else "N/A"
+
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Orchestrator {eth_address[:10]}... | Livepeer SLA</title>
+            <style>
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 24px 32px; background: #0d1117; color: #c9d1d9; }}
+                a {{ color: #58a6ff; text-decoration: none; }}
+                a:hover {{ text-decoration: underline; }}
+                .back {{ color: #8b949e; font-size: 13px; margin-bottom: 16px; display: block; }}
+                h1 {{ color: #fff; margin: 0 0 8px 0; font-size: 20px; }}
+                .subtitle {{ color: #8b949e; font-size: 14px; margin-bottom: 24px; }}
+                .stats-row {{ display: flex; gap: 32px; margin-bottom: 24px; padding: 16px; background: #161b22; border-radius: 8px; border: 1px solid #30363d; }}
+                .stat {{ text-align: center; }}
+                .stat-val {{ font-size: 24px; font-weight: 600; color: #fff; }}
+                .stat-lbl {{ font-size: 12px; color: #8b949e; }}
+                .panel {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 16px; }}
+                h3 {{ color: #8b949e; font-size: 12px; text-transform: uppercase; margin: 0 0 12px 0; }}
+                table {{ width: 100%; border-collapse: collapse; }}
+                th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #21262d; font-size: 13px; }}
+                th {{ color: #8b949e; font-size: 11px; text-transform: uppercase; }}
+                .eth-addr {{ background: #30363d; padding: 2px 6px; border-radius: 4px; font-size: 11px; color: #f0883e; font-family: monospace; }}
+            </style>
+        </head>
+        <body>
+            <a href="/" class="back">← Back to Dashboard</a>
+            <h1>Orchestrator <code style="background:#30363d;padding:4px 8px;border-radius:4px;color:#f0883e;">{eth_address}</code></h1>
+            <div class="subtitle">{rank_display} • {stake_display} • {status} • Score: {score}</div>
+
+            <div class="stats-row">
+                <div class="stat">
+                    <div class="stat-val">{earnings.total_tickets if earnings else 0}</div>
+                    <div class="stat-lbl">Tickets (24h)</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-val">{earnings.total_eth:.4f if earnings else 0}</div>
+                    <div class="stat-lbl">ETH Earned</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-val">{earnings.unique_broadcasters if earnings else 0}</div>
+                    <div class="stat-lbl">Unique Gateways</div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Recent Ticket Redemptions</h3>
+                <table>
+                    <thead>
+                        <tr><th>Time</th><th>Gateway</th><th>Amount</th><th>Tx</th></tr>
+                    </thead>
+                    <tbody>
+                        {tickets_html if tickets_html else '<tr><td colspan="4" style="text-align:center;color:#8b949e;padding:20px;">No recent tickets</td></tr>'}
+                    </tbody>
+                </table>
+            </div>
+        </body>
+        </html>
+        """
+
+    @app.get("/gateway/{eth_address}", response_class=HTMLResponse)
+    async def gateway_detail_page(eth_address: str):
+        """Detail page for a specific gateway."""
+        try:
+            traffic = await _subgraph.get_gateway_traffic(gateway_address=eth_address, hours=6)
+        except Exception:
+            traffic = []
+
+        total_tickets = sum(t["ticket_count"] for t in traffic)
+        total_eth = sum(t["total_eth"] for t in traffic)
+
+        # Build orchestrator distribution
+        orchs_html = ""
+        max_tickets = max((t["ticket_count"] for t in traffic), default=1)
+        for t in traffic:
+            bar_width = int((t["ticket_count"] / max_tickets) * 100)
+            orchs_html += f"""
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">
+                <a href="/orchestrator/{t['orchestrator']}" class="eth-addr" style="min-width:160px;">{t['orchestrator'][:8]}...{t['orchestrator'][-6:]}</a>
+                <div style="flex:1;height:20px;background:#21262d;border-radius:4px;overflow:hidden;">
+                    <div style="height:100%;width:{bar_width}%;background:linear-gradient(90deg,#58a6ff,#3fb950);border-radius:4px;"></div>
+                </div>
+                <span style="font-size:11px;color:#8b949e;min-width:120px;text-align:right;">{t['ticket_count']} • {t['total_eth']:.4f} ETH</span>
+            </div>
+            """
+
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Gateway {eth_address[:10]}... | Livepeer SLA</title>
+            <style>
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 24px 32px; background: #0d1117; color: #c9d1d9; }}
+                a {{ color: #58a6ff; text-decoration: none; }}
+                .back {{ color: #8b949e; font-size: 13px; margin-bottom: 16px; display: block; }}
+                h1 {{ color: #fff; margin: 0 0 8px 0; font-size: 20px; }}
+                .subtitle {{ color: #8b949e; font-size: 14px; margin-bottom: 24px; }}
+                .stats-row {{ display: flex; gap: 32px; margin-bottom: 24px; padding: 16px; background: #161b22; border-radius: 8px; border: 1px solid #30363d; }}
+                .stat {{ text-align: center; }}
+                .stat-val {{ font-size: 24px; font-weight: 600; color: #fff; }}
+                .stat-lbl {{ font-size: 12px; color: #8b949e; }}
+                .panel {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }}
+                h3 {{ color: #8b949e; font-size: 12px; text-transform: uppercase; margin: 0 0 12px 0; }}
+                .eth-addr {{ background: #30363d; padding: 2px 6px; border-radius: 4px; font-size: 11px; color: #f0883e; font-family: monospace; }}
+            </style>
+        </head>
+        <body>
+            <a href="/" class="back">← Back to Dashboard</a>
+            <h1>Gateway <code style="background:#30363d;padding:4px 8px;border-radius:4px;color:#f0883e;">{eth_address}</code></h1>
+            <div class="subtitle">Broadcasting work to {len(traffic)} orchestrators</div>
+
+            <div class="stats-row">
+                <div class="stat">
+                    <div class="stat-val">{total_tickets}</div>
+                    <div class="stat-lbl">Tickets Sent (6h)</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-val">{total_eth:.4f}</div>
+                    <div class="stat-lbl">ETH Paid</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-val">{len(traffic)}</div>
+                    <div class="stat-lbl">Orchestrators</div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Traffic Distribution by Orchestrator</h3>
+                {orchs_html if orchs_html else '<p style="color:#8b949e;text-align:center;padding:20px;">No traffic data</p>'}
+            </div>
         </body>
         </html>
         """
@@ -753,8 +1216,23 @@ def create_app() -> FastAPI:
     return app
 
 
+def _format_time_ago(timestamp: int) -> str:
+    """Format a Unix timestamp as a human-readable 'time ago' string."""
+    now = int(time.time())
+    diff = now - timestamp
+
+    if diff < 60:
+        return f"{diff}s ago"
+    elif diff < 3600:
+        return f"{diff // 60}m ago"
+    elif diff < 86400:
+        return f"{diff // 3600}h ago"
+    else:
+        return f"{diff // 86400}d ago"
+
+
 def _summarize_capabilities(caps: Optional[dict]) -> dict:
-    """Create a brief summary of capabilities."""
+    """Create a brief summary of capabilities including GPU metrics."""
     if not caps:
         return {}
 
@@ -763,6 +1241,19 @@ def _summarize_capabilities(caps: Optional[dict]) -> dict:
     if gpus:
         gpu_names = [g.get("name", "Unknown") for g in gpus]
         summary["gpus"] = f"{len(gpus)}x {gpu_names[0]}" if gpu_names else f"{len(gpus)} GPUs"
+
+        # Add real-time GPU metrics from first GPU
+        first_gpu = gpus[0]
+        gpu_util = first_gpu.get("gpu_utilization_percent", 0)
+        gpu_temp = first_gpu.get("temperature_c", 0)
+        gpu_power = first_gpu.get("power_draw_w")
+
+        if gpu_util > 0:
+            summary["gpu_util"] = f"{gpu_util:.0f}%"
+        if gpu_temp > 0:
+            summary["gpu_temp"] = f"{gpu_temp:.0f}°C"
+        if gpu_power is not None and gpu_power > 0:
+            summary["gpu_power"] = f"{gpu_power:.0f}W"
     else:
         summary["gpus"] = "No GPU"
 

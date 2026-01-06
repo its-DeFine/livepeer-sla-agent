@@ -32,6 +32,11 @@ class GPUInfo:
     cuda_version: str = ""
     nvenc_supported: bool = False
     nvdec_supported: bool = False
+    # Real-time metrics (updated each heartbeat)
+    gpu_utilization_percent: float = 0.0
+    memory_utilization_percent: float = 0.0
+    temperature_c: float = 0.0
+    power_draw_w: Optional[float] = None
 
 
 @dataclass
@@ -157,18 +162,16 @@ class CapabilityProber:
         )
 
     def probe_gpus(self) -> list[GPUInfo]:
-        """Detect NVIDIA GPUs using nvidia-smi."""
-        if self._gpu_cache is not None:
-            return self._gpu_cache
-
+        """Detect NVIDIA GPUs using nvidia-smi with real-time metrics."""
+        # Note: No caching - we want fresh metrics each heartbeat
         gpus = []
 
-        # Try nvidia-smi for NVIDIA GPUs
+        # Try nvidia-smi for NVIDIA GPUs with real-time metrics
         try:
             result = subprocess.run(
                 [
                     "nvidia-smi",
-                    "--query-gpu=index,name,memory.total,memory.free,driver_version",
+                    "--query-gpu=index,name,memory.total,memory.free,driver_version,utilization.gpu,utilization.memory,temperature.gpu,power.draw",
                     "--format=csv,noheader,nounits"
                 ],
                 capture_output=True, text=True, timeout=10
@@ -180,6 +183,30 @@ class CapabilityProber:
                         continue
                     parts = [p.strip() for p in line.split(",")]
                     if len(parts) >= 5:
+                        # Parse real-time metrics (may be [N/A] on some systems)
+                        gpu_util = 0.0
+                        mem_util = 0.0
+                        temp = 0.0
+                        power = None
+
+                        if len(parts) >= 9:
+                            try:
+                                gpu_util = float(parts[5]) if parts[5] not in ["[N/A]", "[Not Supported]"] else 0.0
+                            except ValueError:
+                                gpu_util = 0.0
+                            try:
+                                mem_util = float(parts[6]) if parts[6] not in ["[N/A]", "[Not Supported]"] else 0.0
+                            except ValueError:
+                                mem_util = 0.0
+                            try:
+                                temp = float(parts[7]) if parts[7] not in ["[N/A]", "[Not Supported]"] else 0.0
+                            except ValueError:
+                                temp = 0.0
+                            try:
+                                power = float(parts[8]) if parts[8] not in ["[N/A]", "[Not Supported]"] else None
+                            except ValueError:
+                                power = None
+
                         gpu = GPUInfo(
                             index=int(parts[0]),
                             name=parts[1],
@@ -187,7 +214,11 @@ class CapabilityProber:
                             memory_free_mb=int(float(parts[3])),
                             driver_version=parts[4],
                             nvenc_supported=self._check_nvenc_support(parts[1]),
-                            nvdec_supported=self._check_nvenc_support(parts[1])
+                            nvdec_supported=self._check_nvenc_support(parts[1]),
+                            gpu_utilization_percent=gpu_util,
+                            memory_utilization_percent=mem_util,
+                            temperature_c=temp,
+                            power_draw_w=power
                         )
                         gpus.append(gpu)
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -199,7 +230,6 @@ class CapabilityProber:
             for gpu in gpus:
                 gpu.cuda_version = cuda_version
 
-        self._gpu_cache = gpus
         return gpus
 
     def _check_nvenc_support(self, gpu_name: str) -> bool:

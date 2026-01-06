@@ -120,34 +120,16 @@ uvicorn.run(app, host='0.0.0.0', port=${DASHBOARD_PORT})
         ;;
 
     link)
-        # Helper for address linking
-        if [ -z "$2" ] || [ -z "$3" ]; then
-            echo "Usage: docker run livepeer-sla-agent link <node_id> <eth_address>"
+        # Interactive address linking
+        if [ -z "$2" ]; then
+            echo "Usage: docker run -it livepeer-sla-agent link <eth_address>"
             echo ""
-            echo "This generates a message to sign with your ETH wallet."
+            echo "Links your ETH orchestrator address to this SLA agent."
+            echo "Run with -it for interactive signature input."
             exit 1
         fi
 
-        NODE_ID="$2"
-        ETH_ADDR="$3"
-
-        python -c "
-from agent.eth_link import create_link_for_signing
-import json
-
-result = create_link_for_signing('${NODE_ID}', '${ETH_ADDR}')
-print('=' * 60)
-print('Sign this message with your ETH wallet (MetaMask, etc):')
-print('=' * 60)
-print()
-print(result['message'])
-print()
-print('=' * 60)
-print('Then submit to dashboard:')
-print('  POST /api/v1/link/submit')
-print('  with node_id, eth_address, timestamp, message, eth_signature')
-print('=' * 60)
-"
+        exec python -m agent.cli link "$2" "${@:3}"
         ;;
 
     top100)
@@ -184,9 +166,9 @@ asyncio.run(main())
         echo "  dashboard  Start the dashboard (for network operators)"
         echo "  init       Generate node identity"
         echo "  status     Show node capabilities"
+        echo "  link       Link ETH address (interactive)"
         echo "  attest     Generate signed attestation"
         echo "  verify     Verify an attestation file"
-        echo "  link       Generate address link message"
         echo "  top100     Query top 100 orchestrators"
         echo "  shell      Open bash shell"
         echo ""
@@ -200,6 +182,9 @@ asyncio.run(main())
         echo "  # Run agent connecting to production dashboard"
         echo "  docker run -d -p 9090:9090 -v ~/.livepeer-sla:/root/.livepeer-sla \\"
         echo "    -e DASHBOARD_URL=https://sla.livepeer.network livepeer-sla-agent agent"
+        echo ""
+        echo "  # Link your ETH orchestrator address (interactive)"
+        echo "  docker run -it -v ~/.livepeer-sla:/root/.livepeer-sla livepeer-sla-agent link 0xYourAddress"
         echo ""
         echo "  # Run local dashboard"
         echo "  docker run -d -p 8080:8080 -v ./data:/app/data livepeer-sla-agent dashboard"

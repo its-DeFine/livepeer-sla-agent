@@ -137,7 +137,7 @@ class Storage:
                 self._persist()
 
     def get_network_stats(self) -> dict:
-        """Get network-wide statistics."""
+        """Get network-wide statistics including GPU metrics."""
         with self._lock:
             nodes = list(self._nodes.values())
             online = [n for n in nodes if n.is_online]
@@ -146,6 +146,12 @@ class Storage:
             total_memory_gb = 0
             gpu_types: dict[str, int] = defaultdict(int)
 
+            # GPU real-time metrics aggregation
+            gpu_utilizations: list[float] = []
+            gpu_temperatures: list[float] = []
+            total_power_draw = 0.0
+            gpus_with_power = 0
+
             for node in online:
                 caps = node.last_capabilities or {}
                 gpus = caps.get("gpus", [])
@@ -153,8 +159,26 @@ class Storage:
                 for gpu in gpus:
                     gpu_types[gpu.get("name", "Unknown")] += 1
 
+                    # Collect real-time GPU metrics
+                    util = gpu.get("gpu_utilization_percent", 0)
+                    if util > 0:
+                        gpu_utilizations.append(util)
+
+                    temp = gpu.get("temperature_c", 0)
+                    if temp > 0:
+                        gpu_temperatures.append(temp)
+
+                    power = gpu.get("power_draw_w")
+                    if power is not None and power > 0:
+                        total_power_draw += power
+                        gpus_with_power += 1
+
                 mem = caps.get("memory", {})
                 total_memory_gb += mem.get("total_mb", 0) / 1024
+
+            # Calculate averages
+            avg_gpu_utilization = round(sum(gpu_utilizations) / len(gpu_utilizations), 1) if gpu_utilizations else 0.0
+            avg_gpu_temperature = round(sum(gpu_temperatures) / len(gpu_temperatures), 1) if gpu_temperatures else 0.0
 
             return {
                 "total_nodes": len(nodes),
@@ -162,7 +186,12 @@ class Storage:
                 "total_gpus": total_gpus,
                 "total_memory_gb": round(total_memory_gb, 1),
                 "gpu_types": dict(gpu_types),
-                "total_attestations": sum(n.attestation_count for n in nodes)
+                "total_attestations": sum(n.attestation_count for n in nodes),
+                # GPU real-time metrics
+                "avg_gpu_utilization": avg_gpu_utilization,
+                "avg_gpu_temperature": avg_gpu_temperature,
+                "total_power_draw_w": round(total_power_draw, 1),
+                "gpus_reporting_metrics": len(gpu_utilizations)
             }
 
     def _persist(self):

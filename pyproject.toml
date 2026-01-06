@@ -13,6 +13,8 @@ dependencies = [
     "pydantic>=2.5.0",
     "rich>=13.7.0",            # CLI output
     "typer>=0.9.0",            # CLI framework
+    "eth-abi>=5.0.0",          # Ethereum ABI decoding
+    "eth-utils>=4.0.0",        # Ethereum utilities (keccak)
 ]
 
 [project.optional-dependencies]
