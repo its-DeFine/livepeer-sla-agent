@@ -1,6 +1,15 @@
 # Livepeer SLA Agent
 
-A lightweight attestation agent for Livepeer orchestrators. Provides cryptographic proofs of node capabilities and enables active verification through challenge-response.
+**A free, open-source alternative to expensive SLA monitoring proposals.**
+
+Built in a weekend. Does 80% of what a $200k proposal promises. Zero infrastructure cost.
+
+This agent provides:
+- **On-chain proof of work** - Query ticket redemptions directly from Arbitrum
+- **Real-time GPU metrics** - Utilization, temperature, power consumption
+- **Cryptographic identity** - Ed25519 signatures for attestations
+- **Interactive ETH linking** - Prove wallet ownership via signature
+- **Active verification** - Challenge-response to test actual capability
 
 ## Quick Start (Orchestrators)
 
@@ -158,16 +167,49 @@ livepeer-sla-agent/
 └── docker-compose.yml   # Full stack deployment
 ```
 
-## Comparison to Cloud SPE Proposal
+## Comparison to $200k Proposals
 
-| Aspect | Cloud SPE ($200k) | This Agent |
+| Aspect | Expensive Proposal | This Agent |
 |--------|-------------------|------------|
-| Timeline | 6 months | Tonight |
-| Complexity | Streamr + ETL + Data Warehouse | Single Docker container |
-| Trust model | Report-based | Active verification |
-| Node deployment | Modify go-livepeer | Single docker run |
-| Verification | Passive | Challenge-response |
+| **Cost** | $200,000 | $0 (open source) |
+| **Timeline** | 6 months | 1 weekend |
+| **On-chain proof** | ❌ Not included | ✅ Direct Arbitrum queries |
+| **GPU metrics** | ❌ TBD | ✅ Real-time utilization/temp/power |
+| **ETH address linking** | ❌ Not mentioned | ✅ Interactive CLI |
+| **Infrastructure** | Streamr + ETL + Data Warehouse | Single Docker container |
+| **Dependencies** | Multiple external services | Zero (just public RPC) |
+| **Deployment** | Complex integration | `docker run` |
+| **Verification** | Passive reporting | Active challenge-response |
+
+### What We Track
+
+**Verifiable (on-chain):**
+- Ticket redemptions from TicketBroker contract
+- ETH earned per orchestrator
+- Gateway → Orchestrator traffic flow
+- Active orchestrators receiving work
+
+**Observable (self-reported):**
+- GPU utilization % (every 60s)
+- GPU temperature °C
+- Power consumption (watts)
+- CPU, memory, network info
+
+### What We Don't Track (requires go-livepeer integration)
+
+- Per-job transcoding latency
+- Per-job error rates
+- VMAF/SSIM quality scores
+- Internal pipeline metrics
+
+*These require instrumenting inside go-livepeer itself - a separate, smaller project.*
+
+## The Point
+
+On-chain ticket redemptions already prove orchestrators did work. Livepeer doesn't need a $200k "decentralized metrics foundation" - it needs someone to query the data that's already there.
+
+This project exists to demonstrate that.
 
 ## License
 
-MIT
+MIT - Use it, fork it, improve it.
