@@ -6,6 +6,8 @@ from __future__ import annotations
 import logging
 import os
 import time
+import hashlib
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -26,6 +28,7 @@ from .models import AttestationPayload
 from .storage import get_storage, Storage
 from .verifier import get_verifier, Verifier
 from .proofs import get_proof_generator, get_proof_storage, ProofGenerator, ProofStorage
+from .payments import PaymentsClient, PaymentsConfig, _parse_positive_decimal
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,7 @@ _link_registry: Optional[AddressLinkRegistry] = None
 _proof_generator: Optional[ProofGenerator] = None
 _proof_storage: Optional[ProofStorage] = None
 _subgraph: Optional[LivepeerSubgraph] = None
+_payments: Optional[PaymentsClient] = None
 
 
 def create_app() -> FastAPI:
@@ -74,7 +78,7 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        global _storage, _verifier, _livepeer, _link_registry, _proof_generator, _proof_storage, _subgraph
+        global _storage, _verifier, _livepeer, _link_registry, _proof_generator, _proof_storage, _subgraph, _payments
         _storage = get_storage()
         _verifier = get_verifier()
         _livepeer = get_livepeer_network()
@@ -82,12 +86,31 @@ def create_app() -> FastAPI:
         _proof_generator = get_proof_generator()
         _proof_storage = get_proof_storage()
         _subgraph = get_subgraph()
+
+        payments_url = os.environ.get("PAYMENTS_BACKEND_URL", "").strip().rstrip("/")
+        payments_admin = os.environ.get("PAYMENTS_ADMIN_TOKEN", "").strip()
+        if payments_url and payments_admin:
+            config = PaymentsConfig(
+                base_url=payments_url,
+                admin_token=payments_admin,
+                payout_liveness_eth=_parse_positive_decimal(os.environ.get("PAYMENTS_PAYOUT_LIVENESS_ETH", "")),
+                payout_transcode_eth=_parse_positive_decimal(os.environ.get("PAYMENTS_PAYOUT_TRANSCODE_ETH", "")),
+                payout_gpu_benchmark_eth=_parse_positive_decimal(os.environ.get("PAYMENTS_PAYOUT_GPU_BENCHMARK_ETH", "")),
+            )
+            _payments = PaymentsClient(config)
+            await _payments.__aenter__()
+            logger.info("Payments integration enabled: %s", payments_url)
+        else:
+            _payments = None
+
         await _verifier.__aenter__()
         await _subgraph.__aenter__()
         logger.info("Dashboard started")
         yield
         await _subgraph.__aexit__(None, None, None)
         await _verifier.__aexit__(None, None, None)
+        if _payments is not None:
+            await _payments.__aexit__(None, None, None)
         logger.info("Dashboard stopped")
 
     app = FastAPI(
@@ -499,10 +522,44 @@ def create_app() -> FastAPI:
         # Store proof
         _proof_storage.store_proof(proof)
 
+        payments_result = None
+        payout_eth = _payments.payout_for(request.challenge_type) if _payments else None
+        if payout_eth and result.get("success") and eth_address:
+            try:
+                orchestrator_id = await _payments.resolve_orchestrator_id(eth_address)
+                if orchestrator_id:
+                    artifact_hash = (
+                        str(result.get("output_hash") or "").strip()
+                        or hashlib.sha256(
+                            json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                        ).hexdigest()
+                    )
+                    run_id = (
+                        str(result.get("job_id") or result.get("challenge_id") or "").strip()
+                        or proof.proof_id
+                    )
+                    payments_result = await _payments.credit_verified_workload(
+                        workload_id=f"sla-{proof.proof_id}",
+                        orchestrator_id=orchestrator_id,
+                        payout_amount_eth=payout_eth,
+                        artifact_hash=artifact_hash,
+                        plan_id=request.challenge_type,
+                        run_id=run_id,
+                        notes=f"sla verification: type={request.challenge_type} node_id={request.node_id}",
+                    )
+                else:
+                    payments_result = {
+                        "skipped": True,
+                        "reason": "Orchestrator not registered in payments (address not found)",
+                    }
+            except Exception as exc:
+                payments_result = {"error": str(exc)}
+
         return {
             **result,
             "proof_id": proof.proof_id,
-            "proof": proof.to_dict()
+            "proof": proof.to_dict(),
+            "payments": payments_result,
         }
 
     @app.get("/api/v1/verification-jobs")

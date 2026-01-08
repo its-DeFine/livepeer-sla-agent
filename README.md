@@ -146,6 +146,11 @@ Then visit http://localhost:8080 to see the network dashboard.
 | `MAX_CHALLENGE_DOWNLOAD_BYTES` | `52428800` | Max bytes agent will download for transcode challenge |
 | `ALLOW_UNSAFE_INPUT_URLS` | unset | Set to `1` to bypass SSRF URL guard (not recommended) |
 | `ALLOW_PRIVATE_AGENT_URLS` | unset | Set to `1` to allow private/loopback agent URLs for endpoint registration (not recommended) |
+| `PAYMENTS_BACKEND_URL` | unset | Payments-backend base URL (enables paying for verified challenges) |
+| `PAYMENTS_ADMIN_TOKEN` | unset | Payments admin token used by the dashboard to credit workloads |
+| `PAYMENTS_PAYOUT_LIVENESS_ETH` | unset | ETH payout for successful `liveness` verification |
+| `PAYMENTS_PAYOUT_TRANSCODE_ETH` | unset | ETH payout for successful `transcode` verification |
+| `PAYMENTS_PAYOUT_GPU_BENCHMARK_ETH` | unset | ETH payout for successful `gpu_benchmark` verification |
 
 ## Development
 
