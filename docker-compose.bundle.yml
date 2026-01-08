@@ -82,6 +82,14 @@ services:
           sleep 1
         done
 
+        offers_code="$(curl -sS -o /dev/null -w "%{http_code}" \
+          -H "X-Admin-Token: ${PAYMENTS_ADMIN_TOKEN}" \
+          http://peer-pay:8081/api/workload-offers || true)"
+        if [ "${offers_code}" = "404" ]; then
+          echo "[seed] payments-backend does not support /api/workload-offers yet; skipping"
+          exit 0
+        fi
+
         create_offer () {
           offer_id="$1"
           title="$2"
