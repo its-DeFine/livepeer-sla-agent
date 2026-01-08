@@ -22,6 +22,7 @@ class NodeRecord(BaseModel):
     last_seen: datetime
     attestation_count: int = 0
     last_capabilities: Optional[dict] = None
+    last_heartbeat_interval_seconds: Optional[int] = None
     verification_score: float = 0.0  # 0-100 based on challenge responses
     is_online: bool = True
 

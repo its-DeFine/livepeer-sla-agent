@@ -265,19 +265,11 @@ class ProofStorage:
         self._proofs_by_eth: dict[str, list[VerificationProof]] = {}
         self._top100_attestations: list[Top100Attestation] = []
 
+        self._load_existing()
+
     def store_proof(self, proof: VerificationProof):
         """Store a verification proof."""
-        # Index by node
-        if proof.node_id not in self._proofs_by_node:
-            self._proofs_by_node[proof.node_id] = []
-        self._proofs_by_node[proof.node_id].append(proof)
-
-        # Index by ETH address
-        if proof.eth_address:
-            eth_lower = proof.eth_address.lower()
-            if eth_lower not in self._proofs_by_eth:
-                self._proofs_by_eth[eth_lower] = []
-            self._proofs_by_eth[eth_lower].append(proof)
+        self._index_proof(proof)
 
         # Persist to disk
         proof_file = self.storage_path / f"proof_{proof.proof_id}.json"
@@ -285,7 +277,7 @@ class ProofStorage:
 
     def store_top100_attestation(self, attestation: Top100Attestation):
         """Store a top 100 attestation."""
-        self._top100_attestations.append(attestation)
+        self._index_top100(attestation)
 
         # Persist to disk
         att_file = self.storage_path / f"top100_{attestation.attestation_id}.json"
@@ -339,6 +331,46 @@ class ProofStorage:
             proofs = [p for p in proofs if p.timestamp <= end_time]
 
         return sorted(proofs, key=lambda p: p.timestamp)
+
+    def _index_proof(self, proof: VerificationProof) -> None:
+        """Index a proof in memory (no persistence)."""
+        if proof.node_id not in self._proofs_by_node:
+            self._proofs_by_node[proof.node_id] = []
+        existing = {p.proof_id for p in self._proofs_by_node[proof.node_id]}
+        if proof.proof_id not in existing:
+            self._proofs_by_node[proof.node_id].append(proof)
+
+        if proof.eth_address:
+            eth_lower = proof.eth_address.lower()
+            if eth_lower not in self._proofs_by_eth:
+                self._proofs_by_eth[eth_lower] = []
+            existing_eth = {p.proof_id for p in self._proofs_by_eth[eth_lower]}
+            if proof.proof_id not in existing_eth:
+                self._proofs_by_eth[eth_lower].append(proof)
+
+    def _index_top100(self, attestation: Top100Attestation) -> None:
+        """Index a top100 attestation in memory (no persistence)."""
+        if any(a.attestation_id == attestation.attestation_id for a in self._top100_attestations):
+            return
+        self._top100_attestations.append(attestation)
+
+    def _load_existing(self) -> None:
+        """Load persisted proofs/attestations from disk (best-effort)."""
+        try:
+            for path in sorted(self.storage_path.glob("proof_*.json")):
+                try:
+                    proof = VerificationProof.from_json(path.read_text())
+                    self._index_proof(proof)
+                except Exception:
+                    continue
+            for path in sorted(self.storage_path.glob("top100_*.json")):
+                try:
+                    att = Top100Attestation(**json.loads(path.read_text()))
+                    self._index_top100(att)
+                except Exception:
+                    continue
+        except Exception:
+            return
 
 
 # Global instances

@@ -190,3 +190,23 @@ def get_identity(key_path: Optional[Path] = None) -> NodeIdentity:
     identity = NodeIdentity(key_path)
     identity.load_or_generate()
     return identity
+
+
+def create_endpoint_registration_message(node_id: str, agent_url: str, timestamp: int) -> str:
+    """
+    Create a deterministic message for endpoint registration signatures.
+
+    This binds (node_id, agent_url, timestamp) so the dashboard can verify that the
+    node owner authorized the endpoint mapping.
+    """
+    agent_url = agent_url.rstrip("/")
+    return json.dumps(
+        {
+            "type": "register_endpoint",
+            "node_id": node_id,
+            "agent_url": agent_url,
+            "timestamp": timestamp,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )

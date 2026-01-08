@@ -11,6 +11,7 @@ import time
 import hashlib
 from typing import Optional
 from dataclasses import dataclass, asdict
+from pathlib import Path
 
 # Note: For ETH signature verification, we use eth_account
 # pip install eth-account
@@ -153,9 +154,13 @@ class AddressLinkRegistry:
     Maps node IDs to their linked ETH addresses.
     """
 
-    def __init__(self):
+    def __init__(self, persist_path: Optional[Path] = None):
+        self.persist_path = persist_path
         self._links: dict[str, AddressLink] = {}  # node_id -> link
         self._by_eth: dict[str, str] = {}  # eth_address -> node_id
+
+        if self.persist_path and self.persist_path.exists():
+            self._load()
 
     def add_link(self, link: AddressLink) -> bool:
         """
@@ -183,6 +188,7 @@ class AddressLinkRegistry:
 
         self._links[link.node_id] = link
         self._by_eth[eth_lower] = link.node_id
+        self._persist()
         return True
 
     def get_eth_address(self, node_id: str) -> Optional[str]:
@@ -205,3 +211,34 @@ class AddressLinkRegistry:
     def all_links(self) -> list[AddressLink]:
         """Get all registered links."""
         return list(self._links.values())
+
+    def _persist(self) -> None:
+        """Persist links to disk (best-effort)."""
+        if not self.persist_path:
+            return
+        try:
+            self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = [link.to_dict() for link in self._links.values()]
+            self.persist_path.write_text(json.dumps(payload, indent=2))
+        except Exception:
+            pass
+
+    def _load(self) -> None:
+        """Load persisted links from disk (best-effort)."""
+        if not self.persist_path:
+            return
+        try:
+            data = json.loads(self.persist_path.read_text())
+            if not isinstance(data, list):
+                return
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    link = AddressLink.from_dict(item)
+                except Exception:
+                    continue
+                self._links[link.node_id] = link
+                self._by_eth[link.eth_address.lower()] = link.node_id
+        except Exception:
+            return

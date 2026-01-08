@@ -23,6 +23,8 @@ services:
       - dashboard-data:/app/data
     environment:
       - DASHBOARD_PORT=8080
+      # Local dev convenience: allow docker-network agent endpoints like http://agent:9090
+      - ALLOW_PRIVATE_AGENT_URLS=1
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/"]
       interval: 30s
@@ -45,6 +47,7 @@ services:
       - DASHBOARD_URL=http://dashboard:8080
       - HEARTBEAT_INTERVAL=30
       - AGENT_PORT=9090
+      - AGENT_PUBLIC_URL=http://agent:9090
     depends_on:
       dashboard:
         condition: service_healthy

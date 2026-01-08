@@ -14,6 +14,7 @@ import os
 import platform
 import subprocess
 import socket
+import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 from pathlib import Path
@@ -63,6 +64,11 @@ class NetworkInfo:
     hostname: str
     primary_ip: str
     bandwidth_estimate_mbps: Optional[float] = None  # From benchmark if available
+    # Passive utilization (rates computed from interface counters; not capacity)
+    tx_mbps: float = 0.0
+    rx_mbps: float = 0.0
+    tx_bytes_total: int = 0
+    rx_bytes_total: int = 0
 
 
 @dataclass
@@ -95,15 +101,17 @@ class CapabilityProber:
 
     def __init__(self):
         self._gpu_cache: Optional[list[GPUInfo]] = None
+        self._last_net_sample: Optional[tuple[float, int, int]] = None
 
     def probe_all(self) -> NodeCapabilities:
         """Run all capability probes and return complete snapshot."""
+        gpus = self.probe_gpus()
         return NodeCapabilities(
             cpu=self.probe_cpu(),
             memory=self.probe_memory(),
-            gpus=self.probe_gpus(),
+            gpus=gpus,
             network=self.probe_network(),
-            livepeer=self.probe_livepeer(),
+            livepeer=self.probe_livepeer(has_gpu=bool(gpus)),
             os_info=self._get_os_info(),
             container_runtime=self._detect_container_runtime()
         )
@@ -275,13 +283,40 @@ class CapabilityProber:
         except Exception:
             pass
 
+        tx_mbps = 0.0
+        rx_mbps = 0.0
+        tx_bytes_total = 0
+        rx_bytes_total = 0
+
+        try:
+            io = psutil.net_io_counters()
+            tx_bytes_total = int(io.bytes_sent)
+            rx_bytes_total = int(io.bytes_recv)
+            now = time.monotonic()
+
+            if self._last_net_sample:
+                last_time, last_tx_bytes, last_rx_bytes = self._last_net_sample
+                delta_s = max(0.0001, now - last_time)
+                tx_bps = max(0.0, (tx_bytes_total - last_tx_bytes) / delta_s)
+                rx_bps = max(0.0, (rx_bytes_total - last_rx_bytes) / delta_s)
+                tx_mbps = (tx_bps * 8.0) / 1_000_000.0
+                rx_mbps = (rx_bps * 8.0) / 1_000_000.0
+
+            self._last_net_sample = (now, tx_bytes_total, rx_bytes_total)
+        except Exception:
+            pass
+
         return NetworkInfo(
             hostname=hostname,
             primary_ip=primary_ip,
-            bandwidth_estimate_mbps=None  # Set by benchmark if run
+            bandwidth_estimate_mbps=None,  # Set by benchmark if run
+            tx_mbps=round(tx_mbps, 3),
+            rx_mbps=round(rx_mbps, 3),
+            tx_bytes_total=tx_bytes_total,
+            rx_bytes_total=rx_bytes_total,
         )
 
-    def probe_livepeer(self) -> LivepeerInfo:
+    def probe_livepeer(self, has_gpu: Optional[bool] = None) -> LivepeerInfo:
         """Detect Livepeer-specific capabilities."""
         info = LivepeerInfo()
 
@@ -302,7 +337,7 @@ class CapabilityProber:
             pass
 
         # Default supported codecs for NVIDIA transcoding
-        if info.transcoder_available or self.probe_gpus():
+        if info.transcoder_available or (has_gpu if has_gpu is not None else bool(self.probe_gpus())):
             info.supported_codecs = ["h264", "hevc", "vp8", "vp9"]
             info.supported_profiles = ["P720p60fps16x9", "P720p30fps16x9", "P1080p30fps16x9"]
 

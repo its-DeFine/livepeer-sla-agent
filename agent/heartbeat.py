@@ -106,6 +106,7 @@ class HeartbeatPublisher:
         # Create signed attestation
         attestation = self.identity.sign_attestation({
             "type": "heartbeat",
+            "heartbeat_interval_seconds": self.interval_seconds,
             "capabilities": capabilities.to_dict()
         })
 

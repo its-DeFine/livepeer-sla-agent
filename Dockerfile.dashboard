@@ -7,7 +7,7 @@ COPY pyproject.toml .
 COPY agent/ ./agent/
 COPY dashboard/ ./dashboard/
 
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[eth]"
 
 RUN mkdir -p /app/data
 

@@ -4,11 +4,15 @@ Dashboard server - collects attestations and provides verification API.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
+import socket
+import ipaddress
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -428,6 +432,11 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="Timestamp too old or in future")
 
         agent_url = request.agent_url.rstrip("/")
+        unsafe_ok = os.environ.get("ALLOW_PRIVATE_AGENT_URLS", "").strip().lower() in {"1", "true", "yes"}
+        if not unsafe_ok:
+            ok, reason = _validate_agent_url(agent_url)
+            if not ok:
+                raise HTTPException(status_code=400, detail=f"Unsafe agent_url: {reason}")
         message = create_endpoint_registration_message(request.node_id, agent_url, request.timestamp)
         if not NodeIdentity.verify_challenge_response(
             node_id=request.node_id,
@@ -1417,6 +1426,44 @@ def _summarize_capabilities(caps: Optional[dict]) -> dict:
             summary["bandwidth"] = f"↑{tx:.2f} ↓{rx:.2f} Mbps"
 
     return summary
+
+
+def _validate_agent_url(url: str) -> tuple[bool, str]:
+    """Basic SSRF guard for agent endpoints (public URLs only by default)."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False, "invalid url"
+
+    if parsed.scheme not in {"http", "https"}:
+        return False, "unsupported scheme"
+    if not parsed.hostname:
+        return False, "missing hostname"
+    if parsed.username or parsed.password:
+        return False, "userinfo not allowed"
+    if parsed.path not in {"", "/"}:
+        return False, "path not allowed (use base URL)"
+    if parsed.params or parsed.query or parsed.fragment:
+        return False, "url must not include params/query/fragment"
+
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except Exception:
+        return False, "dns resolution failed"
+
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            return False, f"disallowed ip {ip}"
+
+    return True, "ok"
 
 
 def main():
