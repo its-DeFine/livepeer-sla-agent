@@ -6,6 +6,7 @@ Instead of trusting what nodes report, we test them.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import secrets
 import time
 import logging
@@ -231,12 +232,16 @@ class Verifier:
         storage.record_verification_job(job)
 
         try:
+            trim_duration_seconds = 2.0
+            trim_start_seconds = secrets.randbelow(8000) / 1000.0  # 0s..8s (test clip is ~10s)
             response = await self._client.post(
                 f"{endpoint}/challenge/transcode",
                 json={
                     "job_id": job_id,
                     "input_url": self.test_video_url,
                     "output_profile": profile,
+                    "trim_start_seconds": trim_start_seconds,
+                    "trim_duration_seconds": trim_duration_seconds,
                     "timeout_seconds": timeout
                 },
                 headers=self._challenge_headers(),
@@ -247,13 +252,28 @@ class Verifier:
 
             total_duration = int((time.time() - start_time) * 1000)
 
+            # If the agent provides an output URL, fetch bytes and hash locally.
+            output_hash = result.get("output_hash")
+            output_url = result.get("output_url")
+            if result.get("success") and output_url:
+                try:
+                    fetch = await self._client.get(
+                        f"{endpoint}{output_url}",
+                        headers=self._challenge_headers(),
+                        timeout=timeout + 10,
+                    )
+                    fetch.raise_for_status()
+                    output_hash = hashlib.sha256(fetch.content).hexdigest()
+                except Exception:
+                    pass
+
             # Update job record
             storage.update_verification_job(
                 job_id,
                 completed_at=datetime.utcnow(),
                 success=result.get("success", False),
                 duration_ms=result.get("duration_ms", total_duration),
-                result=result
+                result={**result, "output_hash": output_hash}
             )
 
             # Update node verification score based on results
@@ -268,7 +288,7 @@ class Verifier:
                 "node_id": node_id,
                 "job_id": job_id,
                 "duration_ms": result.get("duration_ms"),
-                "output_hash": result.get("output_hash"),
+                "output_hash": output_hash,
                 "metrics": result.get("metrics"),
                 "error": result.get("error")
             }

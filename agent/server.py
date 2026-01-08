@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from .identity import NodeIdentity, get_identity, create_endpoint_registration_message
@@ -34,6 +35,8 @@ class TranscodeChallenge(BaseModel):
     job_id: str
     input_url: str
     output_profile: str = "P720p30fps16x9"
+    trim_start_seconds: float = 0.0
+    trim_duration_seconds: float = 0.0
     timeout_seconds: int = 60
 
 
@@ -211,9 +214,23 @@ def create_app(
             job_id=challenge.job_id,
             input_url=challenge.input_url,
             output_profile=challenge.output_profile,
+            trim_start_seconds=challenge.trim_start_seconds,
+            trim_duration_seconds=challenge.trim_duration_seconds,
             timeout_seconds=challenge.timeout_seconds
         )
         return result.to_dict()
+
+    @app.get("/challenge/transcode/output/{job_id}")
+    async def get_transcode_output(
+        job_id: str,
+        x_sla_token: Optional[str] = Header(default=None),
+    ):
+        """Fetch the transcoded output bytes for dashboard-side verification (best-effort)."""
+        _enforce_challenge_token(x_sla_token)
+        data = _challenge_handler.get_transcode_output(job_id)
+        if data is None:
+            raise HTTPException(status_code=404, detail="Output not found (expired or not stored)")
+        return Response(content=data, media_type="video/mp4")
 
     @app.post("/challenge/gpu-benchmark")
     async def handle_gpu_benchmark_challenge(

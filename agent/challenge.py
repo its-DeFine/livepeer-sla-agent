@@ -51,6 +51,7 @@ class VerificationResult:
     success: bool
     duration_ms: int
     output_hash: Optional[str] = None
+    output_url: Optional[str] = None
     error: Optional[str] = None
     metrics: Optional[dict] = None
 
@@ -69,6 +70,27 @@ class ChallengeHandler:
         # Challenge nonce tracking to prevent replay
         self._seen_challenges: set[str] = set()
         self._challenge_ttl = 300  # 5 minutes
+
+        # Transcode outputs for dashboard-side hashing (best-effort).
+        self._transcode_outputs: dict[str, tuple[float, bytes]] = {}
+        self._transcode_output_ttl = 600  # 10 minutes
+
+    def _store_transcode_output(self, job_id: str, data: bytes) -> None:
+        now = time.time()
+        expired = [jid for jid, (ts, _) in self._transcode_outputs.items() if now - ts > self._transcode_output_ttl]
+        for jid in expired:
+            self._transcode_outputs.pop(jid, None)
+        self._transcode_outputs[job_id] = (now, data)
+
+    def get_transcode_output(self, job_id: str) -> Optional[bytes]:
+        record = self._transcode_outputs.get(job_id)
+        if not record:
+            return None
+        ts, data = record
+        if time.time() - ts > self._transcode_output_ttl:
+            self._transcode_outputs.pop(job_id, None)
+            return None
+        return data
 
     def handle_liveness_challenge(self, challenge_id: str, challenge: str) -> ChallengeResponse:
         """
@@ -98,6 +120,8 @@ class ChallengeHandler:
         job_id: str,
         input_url: str,
         output_profile: str = "P720p30fps16x9",
+        trim_start_seconds: float = 0.0,
+        trim_duration_seconds: float = 0.0,
         timeout_seconds: int = 60
     ) -> VerificationResult:
         """
@@ -134,6 +158,8 @@ class ChallengeHandler:
                     input_path,
                     output_path,
                     output_profile,
+                    trim_start_seconds,
+                    trim_duration_seconds,
                     timeout_seconds // 2
                 )
 
@@ -146,8 +172,16 @@ class ChallengeHandler:
                         error=transcode_result.get("error", "Transcode failed")
                     )
 
-                # Calculate output hash
-                output_hash = self._hash_file(output_path)
+                max_output = int(os.environ.get("MAX_TRANSCODE_OUTPUT_BYTES", str(50 * 1024 * 1024)))
+                output_size = output_path.stat().st_size
+                if output_size <= max_output:
+                    output_bytes = output_path.read_bytes()
+                    self._store_transcode_output(job_id, output_bytes)
+                    output_url = f"/challenge/transcode/output/{job_id}"
+                    output_hash = hashlib.sha256(output_bytes).hexdigest()
+                else:
+                    output_url = None
+                    output_hash = self._hash_file(output_path)
 
                 duration_ms = int((time.time() - start_time) * 1000)
 
@@ -157,6 +191,7 @@ class ChallengeHandler:
                     success=True,
                     duration_ms=duration_ms,
                     output_hash=output_hash,
+                    output_url=output_url,
                     metrics={
                         "input_size": input_path.stat().st_size,
                         "output_size": output_path.stat().st_size,
@@ -232,6 +267,8 @@ class ChallengeHandler:
         input_path: Path,
         output_path: Path,
         profile: str,
+        trim_start_seconds: float,
+        trim_duration_seconds: float,
         timeout: int
     ) -> dict:
         """Run ffmpeg transcode."""
@@ -245,8 +282,15 @@ class ChallengeHandler:
 
         ffmpeg_args = profiles.get(profile, profiles["P720p30fps16x9"])
 
+        trim_args: list[str] = []
+        if trim_start_seconds and trim_start_seconds > 0:
+            trim_args.extend(["-ss", f"{trim_start_seconds:.3f}"])
+        if trim_duration_seconds and trim_duration_seconds > 0:
+            trim_args.extend(["-t", f"{trim_duration_seconds:.3f}"])
+
         cmd = [
             "ffmpeg", "-y",
+            *trim_args,
             "-i", str(input_path),
             *ffmpeg_args,
             "-an",  # No audio for speed test
