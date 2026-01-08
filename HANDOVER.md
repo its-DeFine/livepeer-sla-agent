@@ -127,6 +127,26 @@ We explicitly chose NOT to require TEE because:
 
 **If TEE is desired later:** TPM 2.0 is most practical (~80% server availability). It proves agent code integrity but NOT that nvidia-smi output is genuine.
 
+### ZK Proofs Assessment (Researched, Not Recommended)
+
+We researched whether zero-knowledge proofs could solve the GPU spoofing problem.
+
+**The Oracle Problem:**
+```
+ZK proves: "Given input X, output Y is correct"
+ZK cannot prove: "Input X came from real hardware"
+```
+
+| Approach | Solves Spoofing? | Why |
+|----------|------------------|-----|
+| ZK-proven nvidia-smi | ❌ No | Input can be faked at kernel level |
+| ZK-proven transcode | ✅ Partially | Proves computation, 30-120s overhead |
+| TEE + ZK (H100 only) | ✅ Yes | Hardware attestation, ~10% availability |
+
+**Conclusion:** ZK is the wrong tool for this problem. Focus on throughput correlation and stress testing instead.
+
+**If ZK is desired later:** Only for H100+ orchestrators with GPU TEE (DCAP attestation wrapped in SP1/RISC Zero proof).
+
 ### Trust Summary
 
 ```
@@ -237,7 +257,7 @@ docker-compose up -d
 docker run -d --gpus all -p 9090:9090 \
   -v ~/.livepeer-sla:/root/.livepeer-sla \
   -e DASHBOARD_URL=https://sla.livepeer.network \
-  ghcr.io/livepeer/sla-agent:latest
+  ghcr.io/its-define/livepeer-sla-agent:main
 ```
 
 ### Link ETH Address (Interactive)
@@ -260,6 +280,7 @@ docker run -it -v ~/.livepeer-sla:/root/.livepeer-sla \
 | `/attestation` | GET | Fresh signed attestation |
 | `/challenge/liveness` | POST | Handle liveness challenge |
 | `/challenge/transcode` | POST | Handle transcode challenge |
+| `/heartbeat/force` | POST | Force immediate heartbeat |
 
 ### Dashboard Endpoints (port 8080)
 
@@ -272,6 +293,8 @@ docker run -it -v ~/.livepeer-sla:/root/.livepeer-sla \
 | `/api/v1/network/redemptions` | GET | On-chain ticket data |
 | `/api/v1/gateways` | GET | Gateway traffic summary |
 | `/api/v1/link/submit` | POST | Submit ETH address link |
+| `/api/v1/nodes/register-endpoint` | POST | Register agent endpoint (requires node-key signature) |
+| `/api/v1/verify` | POST | Send verification challenge |
 | `/api/v1/stats` | GET | Network statistics |
 
 ---
@@ -308,9 +331,9 @@ docker run -it -v ~/.livepeer-sla:/root/.livepeer-sla \
    - Compare orchestrators by output quality
 
 6. **Dashboard persistence**
-   - Currently in-memory
-   - Add SQLite/PostgreSQL for historical data
-   - Enable trend analysis
+   - JSON persistence is implemented for nodes/attestations/heartbeats/jobs (best-effort)
+   - Upgrade to SQLite/PostgreSQL for stronger durability + querying
+   - Enable longer-term trend analysis
 
 ### Lower Priority
 
@@ -385,4 +408,4 @@ dependencies = [
 **The honest position:**
 - Self-reported metrics are CLAIMED, not VERIFIED
 - On-chain data and active challenges are our trust anchors
-- This is a $0 alternative that does 80% of a $200k proposal
+- This is a $0 alternative that covers much of orchestrator-side SLA monitoring, but not the go-livepeer pipeline metrics Cloud SPE targets
