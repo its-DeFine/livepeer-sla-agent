@@ -1,0 +1,149 @@
+# Livepeer "Peer" Bundle (peer-pay + peer-board + optional peer-metrics demo)
+#
+# Start:
+#   docker compose -f docker-compose.bundle.yml up -d
+#
+# With demo agent:
+#   docker compose -f docker-compose.bundle.yml --profile demo up -d
+#
+# Dashboard (peer-board):
+#   http://localhost:8080
+#
+# Payments backend (peer-pay):
+#   http://localhost:8081
+#
+# Notes:
+# - `PAYMENTS_ADMIN_TOKEN` must be set (use `.env.bundle.example` as a template).
+# - Workload offers require payments-backend with the `workload-offers` feature (see payments-backend PRs).
+
+services:
+  peer-pay:
+    image: ${PAYMENTS_IMAGE:-ghcr.io/its-define/payments-backend:latest}
+    container_name: peer-pay
+    restart: unless-stopped
+    env_file:
+      - ${PAYMENTS_ENV_FILE:-.env.bundle}
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - peer-pay-data:/app/data
+    ports:
+      - "${PAYMENTS_PORT:-8081}:8081"
+
+  peer-board:
+    image: ${SLA_IMAGE:-ghcr.io/its-define/livepeer-sla-agent:main}
+    container_name: peer-board
+    command: ["dashboard"]
+    restart: unless-stopped
+    depends_on:
+      peer-pay:
+        condition: service_started
+    env_file:
+      - ${PAYMENTS_ENV_FILE:-.env.bundle}
+    environment:
+      - DASHBOARD_PORT=8080
+      - ALLOW_PRIVATE_AGENT_URLS=1
+      - PAYMENTS_BACKEND_URL=http://peer-pay:8081
+    volumes:
+      - peer-board-data:/app/data
+    ports:
+      - "${DASHBOARD_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  peer-seed-offers:
+    image: curlimages/curl:8.6.0
+    container_name: peer-seed-offers
+    restart: "no"
+    depends_on:
+      - peer-pay
+    env_file:
+      - ${PAYMENTS_ENV_FILE:-.env.bundle}
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        echo "[seed] waiting for payments-backend..."
+        for i in $(seq 1 60); do
+          if curl -fsS http://peer-pay:8081/ >/dev/null; then
+            break
+          fi
+          sleep 1
+        done
+
+        create_offer () {
+          offer_id="$1"
+          title="$2"
+          kind="$3"
+          payout="$4"
+          config_json="$5"
+
+          body="$(cat <<JSON
+        {"offer_id":"${offer_id}","title":"${title}","description":null,"kind":"${kind}","payout_amount_eth":"${payout}","active":true,"config":${config_json}}
+        JSON
+        )"
+
+          code="$(curl -sS -o /tmp/offer-${offer_id}.json -w "%{http_code}" \
+            -X POST "http://peer-pay:8081/api/workload-offers" \
+            -H "Content-Type: application/json" \
+            -H "X-Admin-Token: ${PAYMENTS_ADMIN_TOKEN}" \
+            --data "${body}" || true)"
+
+          if [ "${code}" = "200" ] || [ "${code}" = "409" ]; then
+            echo "[seed] offer ${offer_id}: ok (${code})"
+            return 0
+          fi
+          echo "[seed] offer ${offer_id}: failed (${code})"
+          cat /tmp/offer-${offer_id}.json || true
+          return 1
+        }
+
+        # Default offers (edit payouts/configs for your environment).
+        create_offer "sla-liveness" "Liveness" "sla_liveness" "0.00001" "{}"
+        create_offer "sla-transcode" "Transcode" "sla_transcode" "0.00005" '{"profile":"P720p30fps16x9","timeout_seconds":60}'
+        create_offer "sla-gpu-benchmark" "GPU Benchmark" "sla_gpu_benchmark" "0.00005" '{"benchmark_type":"matrix_4096","timeout_seconds":60}'
+
+        # Burst offers (capacity/anti-rent timing).
+        create_offer "sla-transcode-burst-2" "Transcode Burst x2" "sla_transcode_burst" "0.00010" '{"profile":"P720p30fps16x9","burst_count":2,"timeout_seconds":60,"deadline_seconds":90}'
+        create_offer "sla-gpu-burst-4" "GPU Burst x4" "sla_gpu_benchmark_burst" "0.00020" '{"benchmark_type":"matrix_4096","burst_count":4,"timeout_seconds":60,"deadline_seconds":90}'
+
+        echo "[seed] done"
+
+  peer-metrics-demo:
+    profiles: ["demo"]
+    image: ${SLA_IMAGE:-ghcr.io/its-define/livepeer-sla-agent:main}
+    container_name: peer-metrics-demo
+    command: ["agent"]
+    restart: unless-stopped
+    depends_on:
+      peer-board:
+        condition: service_healthy
+    environment:
+      - DASHBOARD_URL=http://peer-board:8080
+      - HEARTBEAT_INTERVAL=30
+      - AGENT_PORT=9090
+      - AGENT_PUBLIC_URL=http://peer-metrics-demo:9090
+      - SLA_CHALLENGE_TOKEN=${SLA_CHALLENGE_TOKEN:-}
+    ports:
+      - "9090:9090"
+    volumes:
+      - peer-metrics-identity:/root/.livepeer-sla
+
+volumes:
+  peer-pay-data:
+    driver: local
+  peer-board-data:
+    driver: local
+  peer-metrics-identity:
+    driver: local

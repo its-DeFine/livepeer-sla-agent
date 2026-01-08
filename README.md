@@ -196,6 +196,17 @@ python -m dashboard.server
 pytest
 ```
 
+## Full Bundle (peer-pay + peer-board)
+
+Runs payments-backend + SLA dashboard together (optional demo agent profile).
+
+```bash
+cp .env.bundle.example .env.bundle
+docker compose -f docker-compose.bundle.yml up -d
+# demo agent:
+# docker compose -f docker-compose.bundle.yml --profile demo up -d
+```
+
 ## Architecture
 
 ```
