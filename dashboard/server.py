@@ -8,12 +8,13 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from agent.identity import NodeIdentity, SignedAttestation
+from agent.identity import NodeIdentity, SignedAttestation, create_endpoint_registration_message
 from agent.livepeer import get_livepeer_network, LivepeerNetwork
 from agent.eth_link import AddressLink, AddressLinkRegistry, verify_address_link, create_link_for_signing
 from agent.onchain import get_subgraph, LivepeerSubgraph
@@ -29,13 +30,17 @@ logger = logging.getLogger(__name__)
 class RegisterEndpointRequest(BaseModel):
     node_id: str
     agent_url: str
+    timestamp: int
+    signature: str
     eth_address: Optional[str] = None  # Optional ETH address to link
 
 
 class VerifyRequest(BaseModel):
     node_id: str
-    challenge_type: str = "liveness"  # or "transcode"
+    challenge_type: str = "liveness"  # or "transcode" or "gpu_benchmark"
     profile: str = "P720p30fps16x9"
+    benchmark_type: str = "matrix_4096"  # For GPU benchmark challenges
+    gpu_index: Optional[int] = None  # None = test all GPUs
 
 
 class LinkAddressRequest(BaseModel):
@@ -69,7 +74,7 @@ def create_app() -> FastAPI:
         _storage = get_storage()
         _verifier = get_verifier()
         _livepeer = get_livepeer_network()
-        _link_registry = AddressLinkRegistry()
+        _link_registry = AddressLinkRegistry(persist_path=Path("./data/links.json"))
         _proof_generator = get_proof_generator()
         _proof_storage = get_proof_storage()
         _subgraph = get_subgraph()
@@ -127,6 +132,7 @@ def create_app() -> FastAPI:
     @app.get("/api/v1/nodes")
     async def list_nodes(online_only: bool = False):
         """List all known nodes."""
+        _storage.refresh_online_status(timeout_minutes=5)
         nodes = _storage.get_online_nodes() if online_only else _storage.get_all_nodes()
 
         return {
@@ -139,7 +145,10 @@ def create_app() -> FastAPI:
                     "last_seen": n.last_seen.isoformat(),
                     "attestation_count": n.attestation_count,
                     "is_online": n.is_online,
+                    "uptime_1h": _storage.get_node_uptime(n.node_id, period_seconds=3600),
+                    "verification_1h": _storage.get_node_verification_stats(n.node_id, period_seconds=3600),
                     "verification_score": n.verification_score,
+                    "trust_tier": _compute_trust_tier(n, _storage),
                     "capabilities_summary": _summarize_capabilities(n.last_capabilities)
                 }
                 for n in nodes
@@ -168,7 +177,10 @@ def create_app() -> FastAPI:
             "last_seen": node.last_seen.isoformat(),
             "attestation_count": node.attestation_count,
             "is_online": node.is_online,
+            "uptime_1h": _storage.get_node_uptime(node_id, period_seconds=3600),
+            "verification_1h": _storage.get_node_verification_stats(node_id, period_seconds=3600),
             "verification_score": node.verification_score,
+            "trust_tier": _compute_trust_tier(node, _storage),
             "capabilities": node.last_capabilities
         }
 
@@ -239,6 +251,7 @@ def create_app() -> FastAPI:
 
         This shows which top orchestrators have linked SLA agents and their verification status.
         """
+        _storage.refresh_online_status(timeout_minutes=5)
         orchestrators = await _livepeer.get_top_orchestrators(100)
 
         result = []
@@ -250,6 +263,11 @@ def create_app() -> FastAPI:
             proofs = _proof_storage.get_proofs_for_eth(orch.eth_address) if orch.eth_address else []
             latest_proof = proofs[-1] if proofs else None
 
+            uptime_1h = _storage.get_node_uptime(node.node_id, period_seconds=3600) if node else None
+            verification_1h = _storage.get_node_verification_stats(node.node_id, period_seconds=3600) if node else None
+
+            trust_tier = _compute_trust_tier(node, _storage) if node else {"tier": "UNKNOWN", "badge": "❓", "description": "Not linked"}
+
             result.append({
                 "rank": orch.rank,
                 "eth_address": orch.eth_address,
@@ -258,7 +276,10 @@ def create_app() -> FastAPI:
                 "node_id": node_id,
                 "is_linked": node_id is not None,
                 "is_online": node.is_online if node else False,
+                "uptime_1h": uptime_1h,
+                "verification_1h": verification_1h,
                 "verification_score": node.verification_score if node else 0,
+                "trust_tier": trust_tier,
                 "last_verified": latest_proof.timestamp if latest_proof else None,
                 "attestation_count": node.attestation_count if node else 0
             })
@@ -403,7 +424,19 @@ def create_app() -> FastAPI:
     @app.post("/api/v1/nodes/register-endpoint")
     async def register_node_endpoint(request: RegisterEndpointRequest):
         """Register a node's agent endpoint for active verification."""
-        _verifier.register_endpoint(request.node_id, request.agent_url)
+        if abs(time.time() - request.timestamp) > 600:
+            raise HTTPException(status_code=400, detail="Timestamp too old or in future")
+
+        agent_url = request.agent_url.rstrip("/")
+        message = create_endpoint_registration_message(request.node_id, agent_url, request.timestamp)
+        if not NodeIdentity.verify_challenge_response(
+            node_id=request.node_id,
+            challenge=message,
+            signature=request.signature,
+        ):
+            raise HTTPException(status_code=400, detail="Invalid endpoint registration signature")
+
+        _verifier.register_endpoint(request.node_id, agent_url)
 
         # Optionally link ETH address if provided
         eth_address = request.eth_address
@@ -436,6 +469,12 @@ def create_app() -> FastAPI:
             result = await _verifier.verify_liveness(request.node_id)
         elif request.challenge_type == "transcode":
             result = await _verifier.verify_transcode(request.node_id, profile=request.profile)
+        elif request.challenge_type == "gpu_benchmark":
+            result = await _verifier.verify_gpu_benchmark(
+                request.node_id,
+                benchmark_type=request.benchmark_type,
+                gpu_index=request.gpu_index
+            )
         else:
             raise HTTPException(status_code=400, detail="Invalid challenge type")
 
@@ -574,6 +613,9 @@ def create_app() -> FastAPI:
     async def get_network_stats():
         """Get network-wide statistics including top 100 coverage."""
         base_stats = _storage.get_network_stats()
+        online_agents = _storage.get_online_nodes(timeout_minutes=5)
+        uptime_values = [_storage.get_node_uptime(n.node_id, period_seconds=3600)["uptime_percent"] for n in online_agents]
+        avg_uptime_1h = round(sum(uptime_values) / len(uptime_values), 1) if uptime_values else 0.0
 
         # Get top 100 stats
         orchestrators = await _livepeer.get_top_orchestrators(100)
@@ -581,6 +623,7 @@ def create_app() -> FastAPI:
 
         return {
             **base_stats,
+            "avg_uptime_1h": avg_uptime_1h,
             "top_100_total": len(orchestrators),
             "top_100_linked": linked_count,
             "top_100_coverage": f"{(linked_count / max(len(orchestrators), 1)) * 100:.1f}%"
@@ -660,9 +703,29 @@ def create_app() -> FastAPI:
             else:
                 status = '<span class="status-badge">○ Not linked</span>'
 
+            # Compute trust tier for GPU verification
+            trust_tier = _compute_trust_tier(node, _storage) if node else {"tier": "UNKNOWN", "badge": "❓", "description": "Not linked"}
+            tier_badge = trust_tier["badge"]
+            tier_name = trust_tier["tier"]
+            tier_desc = trust_tier["description"]
+
+            # Color-code trust tier
+            tier_colors = {
+                "TESTED": "#3fb950",    # Green
+                "CLAIMED": "#d29922",   # Yellow
+                "SUSPECT": "#f0883e",   # Orange
+                "FAILED": "#f85149",    # Red
+                "UNKNOWN": "#8b949e"    # Gray
+            }
+            tier_color = tier_colors.get(tier_name, "#8b949e")
+
             stake = f"{orch.total_stake / 1000:.1f}k" if orch.total_stake >= 1000 else f"{orch.total_stake:.0f}"
             score = node.verification_score if node else 0
             score_width = int(score)
+            uptime_display = "—"
+            if node:
+                uptime = _storage.get_node_uptime(node.node_id, period_seconds=3600)
+                uptime_display = f"{uptime['uptime_percent']:.1f}%"
 
             top100_html += f"""
             <tr onclick="window.location='/orchestrator/{orch.eth_address}'" style="cursor:pointer;">
@@ -670,6 +733,8 @@ def create_app() -> FastAPI:
                 <td><code class="eth-addr">{orch.eth_address[:8]}...{orch.eth_address[-6:]}</code></td>
                 <td>{stake} LPT</td>
                 <td>{status}</td>
+                <td><span class="trust-badge" style="color:{tier_color};" title="{tier_desc}">{tier_badge} {tier_name}</span></td>
+                <td style="color:#8b949e;font-size:12px;">{uptime_display}</td>
                 <td>
                     <div class="score-bar-container">
                         <div class="score-bar" style="width: {score_width}%"></div>
@@ -685,6 +750,10 @@ def create_app() -> FastAPI:
         gpu_power = stats.get('total_power_draw_w', 0)
         gpus_reporting = stats.get('gpus_reporting_metrics', 0)
 
+        online_agents = _storage.get_online_nodes(timeout_minutes=5)
+        uptime_values = [_storage.get_node_uptime(n.node_id, period_seconds=3600)["uptime_percent"] for n in online_agents]
+        avg_uptime_1h = round(sum(uptime_values) / len(uptime_values), 1) if uptime_values else 0.0
+
         # Color code temperature (green < 70, yellow < 85, red >= 85)
         temp_color = "#3fb950" if gpu_temp < 70 else ("#d29922" if gpu_temp < 85 else "#f85149")
 
@@ -696,6 +765,10 @@ def create_app() -> FastAPI:
             <div class="health-item">
                 <span class="health-label">Online Agents</span>
                 <span class="health-value">{online_count} reporting</span>
+            </div>
+            <div class="health-item">
+                <span class="health-label">Agent Uptime</span>
+                <span class="health-value">{avg_uptime_1h:.1f}% avg (1h)</span>
             </div>
             <div class="health-item">
                 <span class="health-label">Total GPUs</span>
@@ -874,6 +947,13 @@ def create_app() -> FastAPI:
                     min-width: 24px;
                 }}
 
+                /* Trust Badge */
+                .trust-badge {{
+                    font-size: 11px;
+                    font-weight: 500;
+                    white-space: nowrap;
+                }}
+
                 /* Health Panel */
                 .health-item {{
                     display: flex;
@@ -957,18 +1037,20 @@ def create_app() -> FastAPI:
                 <!-- Top Orchestrators -->
                 <div class="panel">
                     <h3>Top Orchestrators</h3>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Rank</th>
-                                <th>Address</th>
-                                <th>Stake</th>
-                                <th>Status</th>
-                                <th style="width:100px;">Score</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {top100_html if top100_html else '<tr><td colspan="5" style="text-align:center;color:#8b949e;padding:20px;">Loading...</td></tr>'}
+	                    <table>
+	                        <thead>
+	                            <tr>
+	                                <th>Rank</th>
+	                                <th>Address</th>
+	                                <th>Stake</th>
+	                                <th>Status</th>
+	                                <th>Trust</th>
+	                                <th>Uptime (1h)</th>
+	                                <th style="width:100px;">Score</th>
+	                            </tr>
+	                        </thead>
+	                        <tbody>
+	                            {top100_html if top100_html else '<tr><td colspan="7" style="text-align:center;color:#8b949e;padding:20px;">Loading...</td></tr>'}
                         </tbody>
                     </table>
                     <p style="color:#6e7681;font-size:11px;margin-top:12px;text-align:center;">
@@ -1079,6 +1161,10 @@ def create_app() -> FastAPI:
         stake_display = f"{orch_data.total_stake / 1000:.1f}k LPT" if orch_data else "N/A"
         status = "🟢 Online" if (node and node.is_online) else ("🟡 Linked" if node_id else "⚪ Not linked")
         score = f"{node.verification_score:.0f}/100" if node else "N/A"
+        uptime_display = "—"
+        if node:
+            uptime = _storage.get_node_uptime(node.node_id, period_seconds=3600)
+            uptime_display = f"{uptime['uptime_percent']:.1f}%"
 
         return f"""
         <!DOCTYPE html>
@@ -1115,12 +1201,16 @@ def create_app() -> FastAPI:
                     <div class="stat-lbl">Tickets (24h)</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-val">{earnings.total_eth:.4f if earnings else 0}</div>
+                    <div class="stat-val">{(earnings.total_eth if earnings else 0.0):.4f}</div>
                     <div class="stat-lbl">ETH Earned</div>
                 </div>
                 <div class="stat">
                     <div class="stat-val">{earnings.unique_broadcasters if earnings else 0}</div>
                     <div class="stat-lbl">Unique Gateways</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-val">{uptime_display}</div>
+                    <div class="stat-lbl">Uptime (1h)</div>
                 </div>
             </div>
 
@@ -1231,6 +1321,60 @@ def _format_time_ago(timestamp: int) -> str:
         return f"{diff // 86400}d ago"
 
 
+def _compute_trust_tier(node, storage: Storage) -> dict:
+    """
+    Compute the trust tier for a node based on GPU benchmark verification.
+
+    Trust tiers:
+    - TESTED: GPU benchmark passed (timing plausible for claimed GPU)
+    - SUSPECT: Benchmark ran but timing doesn't match claimed GPU
+    - FAILED: Benchmark failed or node not reachable
+    - CLAIMED: Self-reported only (no benchmark verification yet)
+
+    Returns dict with tier, badge emoji, and description.
+    """
+    if not node:
+        return {"tier": "UNKNOWN", "badge": "❓", "description": "Node not found"}
+
+    # Check for recent GPU benchmark jobs
+    jobs = storage.get_verification_jobs(node.node_id, limit=10)
+    gpu_benchmark_jobs = [j for j in jobs if j.job_type == "gpu_benchmark"]
+
+    if not gpu_benchmark_jobs:
+        return {
+            "tier": "CLAIMED",
+            "badge": "⚠️",
+            "description": "Self-reported capabilities only"
+        }
+
+    # Check most recent GPU benchmark
+    latest_job = gpu_benchmark_jobs[0]
+
+    if not latest_job.success:
+        return {
+            "tier": "FAILED",
+            "badge": "🚫",
+            "description": "GPU benchmark failed"
+        }
+
+    # Check if result indicates suspect timing
+    result = latest_job.result or {}
+    trust_tier = result.get("trust_tier", "TESTED")
+
+    if trust_tier == "SUSPECT":
+        return {
+            "tier": "SUSPECT",
+            "badge": "⚡",
+            "description": "Timing inconsistent with claimed GPU"
+        }
+
+    return {
+        "tier": "TESTED",
+        "badge": "✅",
+        "description": "GPU benchmark verified"
+    }
+
+
 def _summarize_capabilities(caps: Optional[dict]) -> dict:
     """Create a brief summary of capabilities including GPU metrics."""
     if not caps:
@@ -1264,6 +1408,13 @@ def _summarize_capabilities(caps: Optional[dict]) -> dict:
     cpu = caps.get("cpu", {})
     if cpu:
         summary["cpu"] = f"{cpu.get('cores_physical', '?')} cores"
+
+    net = caps.get("network", {})
+    if net:
+        tx = net.get("tx_mbps", 0.0) or 0.0
+        rx = net.get("rx_mbps", 0.0) or 0.0
+        if tx > 0 or rx > 0:
+            summary["bandwidth"] = f"↑{tx:.2f} ↓{rx:.2f} Mbps"
 
     return summary
 
