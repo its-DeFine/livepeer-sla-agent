@@ -441,27 +441,46 @@ def create_app() -> FastAPI:
                                 "offer_id": offer_id,
                                 "orchestrator_id": orchestrator_id,
                             }
-                            raise RuntimeError("not opted in")
-
-                    artifact_hash = (
-                        str(result.get("output_hash") or "").strip()
-                        or hashlib.sha256(
-                            json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8")
-                        ).hexdigest()
-                    )
-                    run_id = (
-                        str(result.get("job_id") or result.get("challenge_id") or "").strip()
-                        or proof.proof_id
-                    )
-                    payments_result = await _payments.credit_verified_workload(
-                        workload_id=f"sla-{proof.proof_id}",
-                        orchestrator_id=orchestrator_id,
-                        payout_amount_eth=payout_eth,
-                        artifact_hash=artifact_hash,
-                        plan_id=offer_id or request.challenge_type,
-                        run_id=run_id,
-                        notes=f"sla verification: type={verification_type} node_id={node_id}",
-                    )
+                        else:
+                            artifact_hash = (
+                                str(result.get("output_hash") or "").strip()
+                                or hashlib.sha256(
+                                    json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                                ).hexdigest()
+                            )
+                            run_id = (
+                                str(result.get("job_id") or result.get("challenge_id") or "").strip()
+                                or proof.proof_id
+                            )
+                            payments_result = await _payments.credit_verified_workload(
+                                workload_id=f"sla-{proof.proof_id}",
+                                orchestrator_id=orchestrator_id,
+                                payout_amount_eth=payout_eth,
+                                artifact_hash=artifact_hash,
+                                plan_id=offer_id or request.challenge_type,
+                                run_id=run_id,
+                                notes=f"sla verification: type={verification_type} node_id={node_id}",
+                            )
+                    else:
+                        artifact_hash = (
+                            str(result.get("output_hash") or "").strip()
+                            or hashlib.sha256(
+                                json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                            ).hexdigest()
+                        )
+                        run_id = (
+                            str(result.get("job_id") or result.get("challenge_id") or "").strip()
+                            or proof.proof_id
+                        )
+                        payments_result = await _payments.credit_verified_workload(
+                            workload_id=f"sla-{proof.proof_id}",
+                            orchestrator_id=orchestrator_id,
+                            payout_amount_eth=payout_eth,
+                            artifact_hash=artifact_hash,
+                            plan_id=offer_id or request.challenge_type,
+                            run_id=run_id,
+                            notes=f"sla verification: type={verification_type} node_id={node_id}",
+                        )
                 else:
                     payments_result = {
                         "skipped": True,
