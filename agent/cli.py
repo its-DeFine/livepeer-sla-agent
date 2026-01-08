@@ -15,8 +15,9 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
+import httpx
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -32,6 +33,283 @@ app = typer.Typer(
     help="Livepeer SLA attestation agent"
 )
 console = Console()
+
+payments_app = typer.Typer(name="payments", help="Payments-backend helper commands")
+payments_offers_app = typer.Typer(name="offers", help="Workload offer opt-in management")
+payments_app.add_typer(payments_offers_app, name="offers")
+app.add_typer(payments_app, name="payments")
+
+PAYMENTS_AUTH_DOMAIN = "payments-orchestrator-credential:auth:v1"
+
+
+def _normalize_hex_32(value: str) -> str:
+    candidate = (value or "").strip()
+    if candidate.startswith("0x"):
+        candidate = candidate[2:]
+    if len(candidate) != 64:
+        raise ValueError("Expected 32-byte hex value")
+    return "0x" + candidate.lower()
+
+
+def _load_secret_key(*, key: Optional[str], key_file: Optional[Path]) -> str:
+    if key_file:
+        loaded = key_file.read_text(encoding="utf-8").strip()
+        if loaded:
+            key = loaded
+    if not key:
+        key = typer.prompt("Delegate private key (hex)", hide_input=True)
+    candidate = (key or "").strip()
+    if candidate.startswith("0x"):
+        candidate = candidate[2:]
+    if len(candidate) != 64:
+        raise typer.BadParameter("Delegate private key must be 32 bytes (64 hex chars)")
+    return "0x" + candidate.lower()
+
+
+async def _payments_request(
+    method: str,
+    url: str,
+    *,
+    token: Optional[str] = None,
+    json_body: Optional[dict] = None,
+) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        headers: dict[str, str] = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        resp = await client.request(method, url, headers=headers, json=json_body)
+        return resp
+
+
+def _require_eth_account() -> Any:
+    try:
+        from eth_account import Account  # type: ignore
+        from eth_account.messages import encode_defunct  # type: ignore
+    except ImportError as exc:
+        console.print(
+            "[red]Missing dependency:[/red] install with `pip install livepeer-sla-agent[eth]` to use payments credential auth."
+        )
+        raise typer.Exit(1) from exc
+    return Account, encode_defunct
+
+
+def _credential_message_hash(*, orchestrator_id: str, owner: str, delegate: str, nonce: str, expires_at: int) -> bytes:
+    from eth_abi.packed import encode_packed
+    from eth_utils import keccak, to_checksum_address
+
+    packed = encode_packed(
+        ["string", "string", "address", "address", "bytes32", "uint256"],
+        [
+            PAYMENTS_AUTH_DOMAIN,
+            orchestrator_id,
+            to_checksum_address(owner),
+            to_checksum_address(delegate),
+            bytes.fromhex(_normalize_hex_32(nonce)[2:]),
+            int(expires_at),
+        ],
+    )
+    return keccak(packed)
+
+
+@payments_app.command("register")
+def payments_register(
+    orchestrator_id: str = typer.Option(..., "--orchestrator-id", help="Payments orchestrator_id"),
+    eth_address: str = typer.Option(..., "--eth-address", help="Owner orchestrator address (0x...)"),
+    payments_url: str = typer.Option(
+        "http://localhost:9090",
+        "--payments-url",
+        envvar="PAYMENTS_BACKEND_URL",
+        help="Payments backend base URL",
+    ),
+):
+    """Register an orchestrator in payments-backend (required before credential auth)."""
+    async def _run() -> None:
+        resp = await _payments_request(
+            "POST",
+            f"{payments_url.rstrip('/')}/api/orchestrators/register",
+            json_body={
+                "orchestrator_id": orchestrator_id,
+                "address": eth_address,
+                "capability": "livepeer",
+                "contact_email": None,
+                "host_public_ip": None,
+                "host_name": None,
+                "services_healthy": True,
+            },
+        )
+        if resp.status_code != 200:
+            console.print(f"[red]Registration failed ({resp.status_code}):[/red] {resp.text}")
+            raise typer.Exit(1)
+        payload = resp.json()
+        console.print(Panel(json.dumps(payload, indent=2), title="Payments Registration"))
+
+    asyncio.run(_run())
+
+
+@payments_app.command("credential-token")
+def payments_credential_token(
+    orchestrator_id: str = typer.Option(..., "--orchestrator-id", help="Payments orchestrator_id"),
+    payments_url: str = typer.Option(
+        "http://localhost:9090",
+        "--payments-url",
+        envvar="PAYMENTS_BACKEND_URL",
+        help="Payments backend base URL",
+    ),
+    delegate_key: Optional[str] = typer.Option(
+        None,
+        "--delegate-key",
+        envvar="PAYMENTS_DELEGATE_KEY",
+        help="Delegate private key hex (prefer --delegate-key-file or prompt)",
+    ),
+    delegate_key_file: Optional[Path] = typer.Option(
+        None,
+        "--delegate-key-file",
+        help="Path to file containing delegate private key hex",
+    ),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write token JSON to file"),
+):
+    """Mint a short-lived orchestrator token using the on-chain credential + delegate signature."""
+    Account, encode_defunct = _require_eth_account()
+
+    async def _run() -> None:
+        key_hex = _load_secret_key(key=delegate_key, key_file=delegate_key_file)
+        delegate_address = Account.from_key(key_hex).address
+
+        nonce_resp = await _payments_request(
+            "POST",
+            f"{payments_url.rstrip('/')}/api/orchestrators/{orchestrator_id}/credential/nonce",
+        )
+        if nonce_resp.status_code != 200:
+            console.print(f"[red]Nonce request failed ({nonce_resp.status_code}):[/red] {nonce_resp.text}")
+            raise typer.Exit(1)
+        nonce_payload = nonce_resp.json()
+        owner_address = str(nonce_payload.get("owner_address") or "").strip()
+        nonce = str(nonce_payload.get("nonce") or "").strip()
+        expires_at = int(nonce_payload.get("expires_at") or 0)
+
+        msg_hash = _credential_message_hash(
+            orchestrator_id=orchestrator_id,
+            owner=owner_address,
+            delegate=delegate_address,
+            nonce=nonce,
+            expires_at=expires_at,
+        )
+        signed = Account.from_key(key_hex).sign_message(encode_defunct(primitive=msg_hash))
+
+        token_resp = await _payments_request(
+            "POST",
+            f"{payments_url.rstrip('/')}/api/orchestrators/{orchestrator_id}/credential/token",
+            json_body={
+                "delegate_address": delegate_address,
+                "nonce": nonce,
+                "expires_at": expires_at,
+                "signature": signed.signature.hex(),
+            },
+        )
+        if token_resp.status_code != 200:
+            console.print(f"[red]Token request failed ({token_resp.status_code}):[/red] {token_resp.text}")
+            raise typer.Exit(1)
+        token_payload = token_resp.json()
+        if output:
+            output.write_text(json.dumps(token_payload, indent=2), encoding="utf-8")
+            console.print(f"[green]Token written to {output}[/green]")
+        console.print(Panel(json.dumps(token_payload, indent=2), title="Payments Orchestrator Token"))
+
+    asyncio.run(_run())
+
+
+@payments_offers_app.command("available")
+def payments_offers_available(
+    payments_url: str = typer.Option(
+        "http://localhost:9090",
+        "--payments-url",
+        envvar="PAYMENTS_BACKEND_URL",
+        help="Payments backend base URL",
+    ),
+    token: str = typer.Option(..., "--token", envvar="PAYMENTS_ORCHESTRATOR_TOKEN", help="Orchestrator token"),
+):
+    """List active workload offers (requires orchestrator token)."""
+    async def _run() -> None:
+        resp = await _payments_request(
+            "GET",
+            f"{payments_url.rstrip('/')}/api/orchestrators/me/workload-offers/available",
+            token=token,
+        )
+        if resp.status_code != 200:
+            console.print(f"[red]Request failed ({resp.status_code}):[/red] {resp.text}")
+            raise typer.Exit(1)
+        offers = resp.json().get("offers", [])
+        table = Table(title="Available Workload Offers")
+        table.add_column("offer_id", style="cyan")
+        table.add_column("title", style="green")
+        table.add_column("kind", style="magenta")
+        table.add_column("payout_eth", style="yellow")
+        for offer in offers:
+            if not isinstance(offer, dict):
+                continue
+            table.add_row(
+                str(offer.get("offer_id") or ""),
+                str(offer.get("title") or ""),
+                str(offer.get("kind") or ""),
+                str(offer.get("payout_amount_eth") or ""),
+            )
+        console.print(table)
+
+    asyncio.run(_run())
+
+
+@payments_offers_app.command("show")
+def payments_offers_show(
+    payments_url: str = typer.Option(
+        "http://localhost:9090",
+        "--payments-url",
+        envvar="PAYMENTS_BACKEND_URL",
+        help="Payments backend base URL",
+    ),
+    token: str = typer.Option(..., "--token", envvar="PAYMENTS_ORCHESTRATOR_TOKEN", help="Orchestrator token"),
+):
+    """Show selected workload offers for this orchestrator."""
+    async def _run() -> None:
+        resp = await _payments_request(
+            "GET",
+            f"{payments_url.rstrip('/')}/api/orchestrators/me/workload-offers",
+            token=token,
+        )
+        if resp.status_code != 200:
+            console.print(f"[red]Request failed ({resp.status_code}):[/red] {resp.text}")
+            raise typer.Exit(1)
+        payload = resp.json()
+        console.print(Panel(json.dumps(payload, indent=2), title="Selected Workload Offers"))
+
+    asyncio.run(_run())
+
+
+@payments_offers_app.command("select")
+def payments_offers_select(
+    offer_ids: list[str] = typer.Argument(..., help="Offer IDs to opt into"),
+    payments_url: str = typer.Option(
+        "http://localhost:9090",
+        "--payments-url",
+        envvar="PAYMENTS_BACKEND_URL",
+        help="Payments backend base URL",
+    ),
+    token: str = typer.Option(..., "--token", envvar="PAYMENTS_ORCHESTRATOR_TOKEN", help="Orchestrator token"),
+):
+    """Set workload offer opt-ins for this orchestrator."""
+    async def _run() -> None:
+        resp = await _payments_request(
+            "PUT",
+            f"{payments_url.rstrip('/')}/api/orchestrators/me/workload-offers",
+            token=token,
+            json_body={"offer_ids": offer_ids},
+        )
+        if resp.status_code != 200:
+            console.print(f"[red]Request failed ({resp.status_code}):[/red] {resp.text}")
+            raise typer.Exit(1)
+        payload = resp.json()
+        console.print(Panel(json.dumps(payload, indent=2), title="Updated Workload Offers"))
+
+    asyncio.run(_run())
 
 
 @app.command()
