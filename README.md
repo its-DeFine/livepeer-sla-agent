@@ -154,6 +154,15 @@ Then visit http://localhost:8080 to see the network dashboard.
 | `PAYMENTS_OFFER_ID_LIVENESS` | unset | If set, only pay if opted-in to this offer (payout read from payments-backend offer) |
 | `PAYMENTS_OFFER_ID_TRANSCODE` | unset | If set, only pay if opted-in to this offer (payout read from payments-backend offer) |
 | `PAYMENTS_OFFER_ID_GPU_BENCHMARK` | unset | If set, only pay if opted-in to this offer (payout read from payments-backend offer) |
+| `AUTO_VERIFY_ENABLED` | unset | Set to `1` to run a randomized verification loop from the dashboard |
+| `AUTO_VERIFY_INTERVAL_SECONDS` | `1800` | Base interval between auto verifications |
+| `AUTO_VERIFY_JITTER_FRACTION` | `0.5` | Jitter fraction applied to interval (randomized timing) |
+| `AUTO_VERIFY_ONLY_LINKED` | `true` | Only auto-verify nodes with a linked ETH address |
+| `AUTO_VERIFY_CHALLENGE_TYPES` | `liveness,transcode,gpu_benchmark` | Challenge types to run in the loop |
+| `AUTO_VERIFY_TRANSCODE_PROFILES` | `P720p30fps16x9` | Transcode output profiles to choose from |
+| `AUTO_VERIFY_GPU_BENCHMARK_TYPES` | `matrix_4096` | GPU benchmark types to choose from |
+| `AUTO_VERIFY_ONLINE_TIMEOUT_MINUTES` | `10` | Only target nodes seen within this many minutes |
+| `AUTO_VERIFY_NODE_COOLDOWN_SECONDS` | `0` | Optional per-node cooldown (avoid targeting same node too often) |
 
 ## Development
 
