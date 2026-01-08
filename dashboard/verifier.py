@@ -308,6 +308,52 @@ class Verifier:
                 "job_id": job_id
             }
 
+    async def verify_transcode_burst(
+        self,
+        node_id: str,
+        profile: str = "P720p30fps16x9",
+        burst_count: int = 2,
+        timeout: int = 60,
+        deadline_seconds: Optional[float] = None,
+    ) -> dict:
+        """
+        Run multiple transcode verifications concurrently to estimate effective capacity.
+
+        The result includes a concurrency estimate:
+          sum(individual_duration_ms) / wall_clock_ms
+        """
+        burst_count = max(1, min(int(burst_count or 1), 32))
+
+        start_wall = time.time()
+        tasks = [
+            self.verify_transcode(node_id=node_id, profile=profile, timeout=timeout)
+            for _ in range(burst_count)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        wall_clock_ms = int((time.time() - start_wall) * 1000)
+
+        successes = [r for r in results if isinstance(r, dict) and r.get("success")]
+        sum_ms = sum(int(r.get("duration_ms") or 0) for r in successes)
+        concurrency = round(sum_ms / max(1, wall_clock_ms), 3)
+
+        ok = len(successes) == burst_count
+        error = None
+        if deadline_seconds is not None:
+            deadline_ms = int(float(deadline_seconds) * 1000)
+            if wall_clock_ms > deadline_ms:
+                ok = False
+                error = f"Deadline exceeded ({wall_clock_ms}ms > {deadline_ms}ms)"
+
+        return {
+            "success": ok,
+            "node_id": node_id,
+            "burst_count": burst_count,
+            "wall_clock_ms": wall_clock_ms,
+            "concurrency_estimate": concurrency,
+            "results": results,
+            "error": error,
+        }
+
     async def verify_gpu_benchmark(
         self,
         node_id: str,
@@ -476,6 +522,96 @@ class Verifier:
                 "challenge_id": challenge_id,
                 "trust_tier": "FAILED"
             }
+
+    async def verify_gpu_benchmark_burst(
+        self,
+        node_id: str,
+        benchmark_type: str = "matrix_4096",
+        burst_count: int = 2,
+        timeout: int = 60,
+        deadline_seconds: Optional[float] = None,
+    ) -> dict:
+        """
+        Run multiple GPU benchmark verifications concurrently to estimate effective parallel capacity.
+
+        Uses `/gpu-info` to pick GPU indices when possible, but will still attempt index 0..N-1 if not.
+        """
+        burst_count = max(1, min(int(burst_count or 1), 32))
+
+        endpoint = self.get_endpoint(node_id)
+        if not endpoint:
+            return {"success": False, "error": "No endpoint registered for node", "node_id": node_id}
+
+        gpu_indices: list[int] = []
+        if self._client:
+            try:
+                resp = await self._client.get(
+                    f"{endpoint}/gpu-info",
+                    headers=self._challenge_headers(),
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    gpus = payload.get("gpus", [])
+                    if isinstance(gpus, list):
+                        for item in gpus:
+                            if not isinstance(item, dict):
+                                continue
+                            idx = item.get("index")
+                            if isinstance(idx, int):
+                                gpu_indices.append(idx)
+                            elif isinstance(idx, str) and idx.isdigit():
+                                gpu_indices.append(int(idx))
+            except Exception:
+                gpu_indices = []
+
+        if not gpu_indices:
+            gpu_indices = list(range(burst_count))
+
+        selected: list[int] = []
+        pool = list(gpu_indices)
+        while pool and len(selected) < min(burst_count, len(gpu_indices)):
+            i = secrets.randbelow(len(pool))
+            selected.append(pool.pop(i))
+        while len(selected) < burst_count:
+            selected.append(gpu_indices[secrets.randbelow(len(gpu_indices))])
+
+        start_wall = time.time()
+        tasks = [
+            self.verify_gpu_benchmark(
+                node_id=node_id,
+                benchmark_type=benchmark_type,
+                gpu_index=gpu_index,
+                timeout=timeout,
+            )
+            for gpu_index in selected
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        wall_clock_ms = int((time.time() - start_wall) * 1000)
+
+        successes = [r for r in results if isinstance(r, dict) and r.get("success")]
+        sum_ms = sum(int(r.get("total_duration_ms") or 0) for r in successes)
+        concurrency = round(sum_ms / max(1, wall_clock_ms), 3)
+
+        ok = len(successes) == burst_count
+        error = None
+        if deadline_seconds is not None:
+            deadline_ms = int(float(deadline_seconds) * 1000)
+            if wall_clock_ms > deadline_ms:
+                ok = False
+                error = f"Deadline exceeded ({wall_clock_ms}ms > {deadline_ms}ms)"
+
+        return {
+            "success": ok,
+            "node_id": node_id,
+            "benchmark_type": benchmark_type,
+            "burst_count": burst_count,
+            "gpu_indices": selected,
+            "wall_clock_ms": wall_clock_ms,
+            "concurrency_estimate": concurrency,
+            "results": results,
+            "error": error,
+        }
 
     async def verify_all_nodes(self, challenge_type: str = "liveness") -> list[dict]:
         """Verify all registered nodes."""

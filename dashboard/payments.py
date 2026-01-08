@@ -152,6 +152,43 @@ class PaymentsClient:
         self._subscriptions_cache_ts = now
         return offer_id in (self._subscriptions_cache.get(orchestrator_id) or [])
 
+    async def subscribed_offer_ids(self, orchestrator_id: str) -> list[str]:
+        """Return the offer IDs this orchestrator opted into (admin-only)."""
+        orchestrator_id = (orchestrator_id or "").strip()
+        if not orchestrator_id:
+            return []
+
+        now = time.time()
+        if self._subscriptions_cache and now - self._subscriptions_cache_ts < 30:
+            return list(self._subscriptions_cache.get(orchestrator_id) or [])
+
+        if not self._client:
+            raise RuntimeError("PaymentsClient not started")
+
+        resp = await self._client.get(
+            f"{self.config.base_url}/api/workload-offers/subscriptions",
+            headers={"X-Admin-Token": self.config.admin_token},
+        )
+        if resp.status_code == 404:
+            # Older payments-backend: no opt-in support yet.
+            self._subscriptions_cache = {}
+            self._subscriptions_cache_ts = now
+            return []
+        resp.raise_for_status()
+        payload = resp.json()
+        subs = payload.get("subscriptions", {})
+        cache: dict[str, list[str]] = {}
+        if isinstance(subs, dict):
+            for orch_id, offers in subs.items():
+                if not isinstance(orch_id, str):
+                    continue
+                if not isinstance(offers, list):
+                    continue
+                cache[orch_id] = [str(item) for item in offers if isinstance(item, str) and item]
+        self._subscriptions_cache = cache
+        self._subscriptions_cache_ts = now
+        return list(self._subscriptions_cache.get(orchestrator_id) or [])
+
     async def resolve_orchestrator_id(self, eth_address: str) -> Optional[str]:
         """Resolve payments orchestrator_id by ETH address (admin-only)."""
         if not self._client:

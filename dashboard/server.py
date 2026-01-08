@@ -46,6 +46,7 @@ class RegisterEndpointRequest(BaseModel):
 
 class VerifyRequest(BaseModel):
     node_id: str
+    offer_id: Optional[str] = None  # Payments workload offer to run (preferred when using peer-pay)
     challenge_type: str = "liveness"  # or "transcode" or "gpu_benchmark"
     profile: str = "P720p30fps16x9"
     benchmark_type: str = "matrix_4096"  # For GPU benchmark challenges
@@ -118,6 +119,11 @@ def create_app() -> FastAPI:
             timeout_minutes = int(os.environ.get("AUTO_VERIFY_ONLINE_TIMEOUT_MINUTES", "10") or 10)
             only_linked = os.environ.get("AUTO_VERIFY_ONLY_LINKED", "true").strip().lower() in {"1", "true", "yes"}
             cooldown_s = float(os.environ.get("AUTO_VERIFY_NODE_COOLDOWN_SECONDS", "0") or 0)
+            use_payments_offers = os.environ.get("AUTO_VERIFY_USE_PAYMENTS_OFFERS", "true").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+            }
 
             challenge_types_raw = os.environ.get("AUTO_VERIFY_CHALLENGE_TYPES", "liveness,transcode,gpu_benchmark")
             challenge_types = [c.strip() for c in challenge_types_raw.split(",") if c.strip()]
@@ -165,6 +171,33 @@ def create_app() -> FastAPI:
 
                     node_id = eligible[secrets.randbelow(len(eligible))]
                     eth_address = _link_registry.get_eth_address(node_id)
+
+                    if use_payments_offers and _payments and eth_address:
+                        try:
+                            orchestrator_id = await _payments.resolve_orchestrator_id(eth_address)
+                            if orchestrator_id:
+                                offer_ids = await _payments.subscribed_offer_ids(orchestrator_id)
+                                active_offer_ids: list[str] = []
+                                for oid in offer_ids:
+                                    offer = await _payments.get_offer(oid)
+                                    if offer and bool(offer.get("active", False)):
+                                        active_offer_ids.append(oid)
+                                if active_offer_ids:
+                                    chosen_offer = active_offer_ids[secrets.randbelow(len(active_offer_ids))]
+                                    result = await _run_verification(
+                                        VerifyRequest(node_id=node_id, offer_id=chosen_offer)
+                                    )
+                                    last_verified_at[node_id] = time.time()
+                                    logger.info(
+                                        "auto-verify: node=%s offer=%s success=%s",
+                                        node_id,
+                                        chosen_offer,
+                                        bool(result.get("success")),
+                                    )
+                                    await asyncio.sleep(_next_sleep())
+                                    continue
+                        except Exception as exc:
+                            logger.warning("auto-verify offers mode error: %s", exc)
 
                     allowed_types = list(challenge_types)
                     if _payments and eth_address:
@@ -247,32 +280,143 @@ def create_app() -> FastAPI:
         """
         Shared verification implementation used by both the API endpoint and optional auto-verify loop.
         """
+        node_id = request.node_id
+        requested_offer_id = (request.offer_id or "").strip() or None
+
         # Get linked ETH address and rank
-        eth_address = _link_registry.get_eth_address(request.node_id)
+        eth_address = _link_registry.get_eth_address(node_id)
         orchestrator_rank = None
 
         if eth_address:
             is_top, rank = await _livepeer.is_top_orchestrator(eth_address)
             orchestrator_rank = rank if is_top else None
 
-        # Run verification
-        if request.challenge_type == "liveness":
-            result = await _verifier.verify_liveness(request.node_id)
-        elif request.challenge_type == "transcode":
-            result = await _verifier.verify_transcode(request.node_id, profile=request.profile)
-        elif request.challenge_type == "gpu_benchmark":
-            result = await _verifier.verify_gpu_benchmark(
-                request.node_id,
-                benchmark_type=request.benchmark_type,
-                gpu_index=request.gpu_index
-            )
+        orchestrator_id: Optional[str] = None
+        offer_id: Optional[str] = None
+        payout_eth: Optional[str] = None
+        verification_type: str = request.challenge_type
+
+        if requested_offer_id:
+            if not _payments:
+                raise HTTPException(status_code=503, detail="Payments backend not configured")
+            if not eth_address:
+                raise HTTPException(status_code=400, detail="Node must link an ETH address to run offers")
+
+            orchestrator_id = await _payments.resolve_orchestrator_id(eth_address)
+            if not orchestrator_id:
+                raise HTTPException(status_code=400, detail="Orchestrator not registered in payments backend")
+
+            subscribed = await _payments.is_subscribed(orchestrator_id, requested_offer_id)
+            if not subscribed:
+                raise HTTPException(status_code=403, detail="Orchestrator not opted into this offer")
+
+            offer = await _payments.get_offer(requested_offer_id)
+            if not offer:
+                raise HTTPException(status_code=404, detail="Offer not found")
+            if not bool(offer.get("active", False)):
+                raise HTTPException(status_code=400, detail="Offer is inactive")
+
+            offer_kind = str(offer.get("kind") or "").strip()
+            offer_cfg = offer.get("config")
+            offer_config = offer_cfg if isinstance(offer_cfg, dict) else {}
+            offer_id = requested_offer_id
+
+            payout_eth = _parse_positive_decimal(str(offer.get("payout_amount_eth") or ""))
+            if not payout_eth:
+                raise HTTPException(status_code=400, detail="Offer payout_amount_eth must be > 0")
+
+            verification_type = offer_kind or f"offer:{offer_id}"
+
+            if offer_kind == "sla_liveness":
+                result = await _verifier.verify_liveness(node_id)
+            elif offer_kind == "sla_transcode":
+                profile = str(offer_config.get("profile") or request.profile)
+                timeout = int(offer_config.get("timeout_seconds") or 60)
+                result = await _verifier.verify_transcode(node_id, profile=profile, timeout=timeout)
+            elif offer_kind == "sla_transcode_burst":
+                profile = str(offer_config.get("profile") or request.profile)
+                timeout = int(offer_config.get("timeout_seconds") or 60)
+                burst_count = int(offer_config.get("burst_count") or 2)
+                deadline_seconds = offer_config.get("deadline_seconds")
+                result = await _verifier.verify_transcode_burst(
+                    node_id,
+                    profile=profile,
+                    burst_count=burst_count,
+                    timeout=timeout,
+                    deadline_seconds=float(deadline_seconds) if deadline_seconds is not None else None,
+                )
+            elif offer_kind == "sla_gpu_benchmark":
+                benchmark_type = str(offer_config.get("benchmark_type") or request.benchmark_type)
+                timeout = int(offer_config.get("timeout_seconds") or 60)
+                cfg_gpu_index = offer_config.get("gpu_index")
+                gpu_index: Optional[int]
+                if isinstance(cfg_gpu_index, int):
+                    gpu_index = cfg_gpu_index
+                elif cfg_gpu_index is None:
+                    gpu_index = request.gpu_index
+                else:
+                    gpu_index = None
+                result = await _verifier.verify_gpu_benchmark(
+                    node_id,
+                    benchmark_type=benchmark_type,
+                    gpu_index=gpu_index,
+                    timeout=timeout,
+                )
+            elif offer_kind == "sla_gpu_benchmark_burst":
+                benchmark_type = str(offer_config.get("benchmark_type") or request.benchmark_type)
+                timeout = int(offer_config.get("timeout_seconds") or 60)
+                burst_count = int(offer_config.get("burst_count") or 2)
+                deadline_seconds = offer_config.get("deadline_seconds")
+                result = await _verifier.verify_gpu_benchmark_burst(
+                    node_id,
+                    benchmark_type=benchmark_type,
+                    burst_count=burst_count,
+                    timeout=timeout,
+                    deadline_seconds=float(deadline_seconds) if deadline_seconds is not None else None,
+                )
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported offer kind: {offer_kind}")
+
+            # Attach offer metadata to the result for auditing/payouts.
+            result = {
+                **(result if isinstance(result, dict) else {"success": False, "error": "invalid result"}),
+                "offer_id": offer_id,
+                "offer_kind": offer_kind,
+            }
         else:
-            raise HTTPException(status_code=400, detail="Invalid challenge type")
+            # Run verification (manual challenge types).
+            if request.challenge_type == "liveness":
+                result = await _verifier.verify_liveness(node_id)
+            elif request.challenge_type == "transcode":
+                result = await _verifier.verify_transcode(node_id, profile=request.profile)
+            elif request.challenge_type == "gpu_benchmark":
+                result = await _verifier.verify_gpu_benchmark(
+                    node_id,
+                    benchmark_type=request.benchmark_type,
+                    gpu_index=request.gpu_index
+                )
+            else:
+                raise HTTPException(status_code=400, detail="Invalid challenge type")
+
+            payout_eth = _payments.payout_for(request.challenge_type) if _payments else None
+            offer_id = _payments.offer_id_for(request.challenge_type) if _payments else None
+
+            if _payments and offer_id:
+                try:
+                    offer = await _payments.get_offer(offer_id)
+                    if not offer:
+                        offer_id = None
+                    elif not bool(offer.get("active", False)):
+                        offer_id = None
+                    else:
+                        payout_eth = _parse_positive_decimal(str(offer.get("payout_amount_eth") or "")) or payout_eth
+                except Exception:
+                    offer_id = None
 
         # Create proof of verification
         proof = _proof_generator.create_verification_proof(
-            node_id=request.node_id,
-            verification_type=request.challenge_type,
+            node_id=node_id,
+            verification_type=verification_type,
             result=result,
             eth_address=eth_address,
             orchestrator_rank=orchestrator_rank
@@ -282,39 +426,22 @@ def create_app() -> FastAPI:
         _proof_storage.store_proof(proof)
 
         payments_result = None
-        payout_eth = _payments.payout_for(request.challenge_type) if _payments else None
-        offer_id = _payments.offer_id_for(request.challenge_type) if _payments else None
 
-        if _payments and offer_id:
+        if payout_eth and isinstance(result, dict) and result.get("success") and eth_address and _payments:
             try:
-                offer = await _payments.get_offer(offer_id)
-                if not offer:
-                    payments_result = {"skipped": True, "reason": f"Offer not found: {offer_id}"}
-                elif not bool(offer.get("active", False)):
-                    payments_result = {"skipped": True, "reason": f"Offer inactive: {offer_id}"}
-                else:
-                    payout_eth = _parse_positive_decimal(str(offer.get("payout_amount_eth") or "")) or payout_eth
-            except Exception as exc:
-                payments_result = {"error": str(exc)}
-
-        if payout_eth and result.get("success") and eth_address and _payments and payments_result is None:
-            try:
-                orchestrator_id = await _payments.resolve_orchestrator_id(eth_address)
+                if orchestrator_id is None:
+                    orchestrator_id = await _payments.resolve_orchestrator_id(eth_address)
                 if orchestrator_id:
-                    if offer_id:
+                    if offer_id and not requested_offer_id:
                         subscribed = await _payments.is_subscribed(orchestrator_id, offer_id)
                         if not subscribed:
-                            return {
-                                **result,
-                                "proof_id": proof.proof_id,
-                                "proof": proof.to_dict(),
-                                "payments": {
-                                    "skipped": True,
-                                    "reason": f"Orchestrator not opted into offer {offer_id}",
-                                    "offer_id": offer_id,
-                                    "orchestrator_id": orchestrator_id,
-                                },
+                            payments_result = {
+                                "skipped": True,
+                                "reason": f"Orchestrator not opted into offer {offer_id}",
+                                "offer_id": offer_id,
+                                "orchestrator_id": orchestrator_id,
                             }
+                            raise RuntimeError("not opted in")
 
                     artifact_hash = (
                         str(result.get("output_hash") or "").strip()
@@ -333,7 +460,7 @@ def create_app() -> FastAPI:
                         artifact_hash=artifact_hash,
                         plan_id=offer_id or request.challenge_type,
                         run_id=run_id,
-                        notes=f"sla verification: type={request.challenge_type} node_id={request.node_id}",
+                        notes=f"sla verification: type={verification_type} node_id={node_id}",
                     )
                 else:
                     payments_result = {
@@ -341,7 +468,8 @@ def create_app() -> FastAPI:
                         "reason": "Orchestrator not registered in payments (address not found)",
                     }
             except Exception as exc:
-                payments_result = {"error": str(exc)}
+                if payments_result is None:
+                    payments_result = {"error": str(exc)}
 
         return {
             **result,
