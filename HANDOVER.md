@@ -147,6 +147,55 @@ ZK cannot prove: "Input X came from real hardware"
 
 **If ZK is desired later:** Only for H100+ orchestrators with GPU TEE (DCAP attestation wrapped in SP1/RISC Zero proof).
 
+### GPU Proof-of-Work Verification (NEW - IMPLEMENTED)
+
+Based on the insight that **"you can fake nvidia-smi output, but you can't fake physics"**, we implemented a GPU benchmark verification system.
+
+**Core Principle:**
+```
+Old: "What GPU do you claim?" → nvidia-smi → can be faked
+New: "Prove your GPU can do X in Y time" → actual benchmark → can't fake physics
+```
+
+**How It Works:**
+1. Dashboard sends random seed to agent
+2. Agent runs deterministic GPU benchmark (matrix multiply or transcode)
+3. Dashboard receives timing + result hash
+4. Dashboard compares timing against GPU performance profiles
+5. Trust tier assigned based on results
+
+**Trust Tiers:**
+| Tier | Badge | Requirements |
+|------|-------|--------------|
+| ✅ TESTED | Green | GPU benchmark passed (timing matches claimed GPU) |
+| ⚠️ CLAIMED | Yellow | Self-reported only (no benchmark verification yet) |
+| ⚡ SUSPECT | Orange | Benchmark ran but timing inconsistent with claimed GPU |
+| 🚫 FAILED | Red | Benchmark failed or node unreachable |
+
+**Benchmark Types:**
+- `matrix_4096` - 4096x4096 matrix multiply (quick, ~45ms on RTX 4090)
+- `matrix_8192` - 8192x8192 matrix multiply (thorough, ~180ms on RTX 4090)
+- `transcode_720p` - 720p video transcode (real workload test)
+- `transcode_1080p` - 1080p video transcode
+
+**GPU Profiles Database:**
+We maintain expected timing ranges for 20+ GPU models:
+- NVIDIA GeForce RTX 4090, 4080, 4070 series
+- NVIDIA GeForce RTX 3090, 3080, 3070 series
+- NVIDIA A100, A6000, A5000 (datacenter)
+- NVIDIA RTX A4000, T4, V100
+
+**Why This Helps:**
+- Catches fake GPU claims (wrong timing for claimed model)
+- Catches software emulation (way too slow)
+- Verifiable without special hardware
+- Can be run on-demand or periodically
+
+**Limitations:**
+- Still can't verify TOTAL capacity when GPUs are busy
+- Requires known GPU profiles (unknown GPUs get neutral scores)
+- TEE integration would make timing unfakeable (future work)
+
 ### Trust Summary
 
 ```
@@ -225,17 +274,19 @@ livepeer-sla-agent/
 │   ├── identity.py      # Ed25519 key management, signing
 │   ├── capabilities.py  # Hardware detection (GPU, CPU, memory)
 │   ├── heartbeat.py     # Periodic attestation publishing
-│   ├── challenge.py     # Challenge-response handling
+│   ├── challenge.py     # Challenge-response handling (liveness, transcode, GPU benchmark)
 │   ├── eth_link.py      # ETH address linking logic
 │   ├── onchain.py       # Arbitrum RPC queries
 │   ├── server.py        # Agent HTTP API (FastAPI)
-│   └── cli.py           # Typer CLI (init, status, link, run)
+│   ├── cli.py           # Typer CLI (init, status, link, run)
+│   ├── gpu_benchmark.py # GPU benchmark framework (matrix multiply, transcode) [NEW]
+│   └── gpu_profiles.py  # Expected GPU performance baselines [NEW]
 ├── dashboard/
 │   ├── models.py        # Pydantic data models
 │   ├── storage.py       # In-memory storage + aggregation
-│   ├── verifier.py      # Active verification sender
+│   ├── verifier.py      # Active verification sender (includes GPU benchmark)
 │   ├── proofs.py        # Cryptographic verification
-│   └── server.py        # Dashboard HTTP API + UI
+│   └── server.py        # Dashboard HTTP API + UI (includes trust tier display)
 ├── Dockerfile           # Multi-command container
 ├── docker-compose.yml   # Local development stack
 └── pyproject.toml       # Python dependencies
@@ -280,6 +331,8 @@ docker run -it -v ~/.livepeer-sla:/root/.livepeer-sla \
 | `/attestation` | GET | Fresh signed attestation |
 | `/challenge/liveness` | POST | Handle liveness challenge |
 | `/challenge/transcode` | POST | Handle transcode challenge |
+| `/challenge/gpu-benchmark` | POST | Handle GPU benchmark challenge [NEW] |
+| `/gpu-info` | GET | GPU info and benchmark capabilities [NEW] |
 | `/heartbeat/force` | POST | Force immediate heartbeat |
 
 ### Dashboard Endpoints (port 8080)
@@ -393,19 +446,49 @@ dependencies = [
 
 ## Summary for Codex Agent
 
-**What to build next (in priority order):**
+### Recently Implemented (GPU Proof-of-Work Verification)
 
-1. Add throughput-to-capacity correlation to catch GPU count lies
-2. Add historical peak tracking as evidence of true capacity
-3. Implement automated periodic verification challenges
-4. Consider TPM attestation for agent integrity (optional)
+**Files added/modified:**
+| File | Description |
+|------|-------------|
+| `agent/gpu_benchmark.py` | ~500 lines - Deterministic GPU benchmarks (matrix multiply + transcode) |
+| `agent/gpu_profiles.py` | ~400 lines - Expected timing profiles for 20+ GPU models |
+| `agent/challenge.py` | Added `handle_gpu_benchmark_challenge()` method |
+| `agent/server.py` | Added `/challenge/gpu-benchmark` and `/gpu-info` endpoints |
+| `dashboard/verifier.py` | Added `verify_gpu_benchmark()` method with trust tier assignment |
+| `dashboard/server.py` | Added trust tier display in UI, GPU benchmark verify endpoint |
 
-**What NOT to attempt:**
+**Key design decisions:**
+1. **Deterministic benchmarks** - Same seed → same result → verifiable output hash
+2. **Two benchmark types** - Matrix multiply (pure compute) + transcode (real workload)
+3. **Tolerance-based scoring** - 25% margin for system variance
+4. **Trust tiers** - TESTED > CLAIMED > SUSPECT > FAILED
+
+**Testing the GPU benchmark:**
+```bash
+# From agent side - check GPU info
+curl http://localhost:9090/gpu-info
+
+# From dashboard - trigger benchmark verification
+curl -X POST http://localhost:8080/api/v1/verify \
+  -H "Content-Type: application/json" \
+  -d '{"node_id": "<node_id>", "challenge_type": "gpu_benchmark", "benchmark_type": "matrix_4096"}'
+```
+
+### What to build next (in priority order)
+
+1. **Add TEE timing protection (Phase 4 from plan)** - Wrap benchmarks in Intel SGX for unfakeable timing
+2. **Automated periodic verification loop** - Run GPU benchmarks on schedule, not just on-demand
+3. **Add throughput-to-capacity correlation** - Compare benchmark results vs ticket earnings
+4. **Historical peak tracking** - Track best benchmark times as evidence of true capacity
+
+### What NOT to attempt
 - Per-pipeline metrics (requires go-livepeer changes)
-- TEE for GPU metric verification (hardware not available)
+- Full TEE for GPU metric verification (H100 only, ~10% availability)
 - Solving the "busy GPUs" problem completely (intractable without cooperation)
 
-**The honest position:**
-- Self-reported metrics are CLAIMED, not VERIFIED
+### The honest position
+- **TESTED** = GPU benchmark passed (timing matches claimed GPU model)
+- **CLAIMED** = Self-reported only (no benchmark verification yet)
 - On-chain data and active challenges are our trust anchors
-- This is a $0 alternative that covers much of orchestrator-side SLA monitoring, but not the go-livepeer pipeline metrics Cloud SPE targets
+- This is a $0 alternative that covers much of orchestrator-side SLA monitoring
