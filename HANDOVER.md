@@ -68,6 +68,45 @@ Cloud SPE proposed a $200k, 6-month project involving:
 
 ---
 
+## Peer Bundle (Optional: paid verification + opt-in offers)
+
+This repo runs standalone, but the **holistic “peer” stack** adds a payments backend so verifications become **paid, opt-in workloads** (and can run at randomized times to make “rent just-in-time” strategies expensive).
+
+Components:
+
+- **peer-metrics**: orchestrator-side agent (this repo’s `sla-agent` container)
+- **peer-board**: this repo’s dashboard (runs verifications + schedules challenges)
+- **peer-pay**: payments-backend (separate repo; workload offer catalog + opt-ins + ledger credits)
+
+Flow:
+
+1) Orchestrator registers in `peer-pay` and opts into workload offers.
+2) `peer-board` runs randomized verification workloads (including **burst** workloads to estimate effective capacity).
+3) On success, `peer-board` creates + verifies a workload in `peer-pay` (admin token) to credit the ledger.
+
+Bundle quickstart (local):
+
+```bash
+cp .env.bundle.example .env.bundle
+docker compose -f docker-compose.bundle.yml up -d
+# optional demo agent:
+# docker compose -f docker-compose.bundle.yml --profile demo up -d
+```
+
+Workload offers:
+- Offers live in `peer-pay` and have `{offer_id, kind, payout_amount_eth, active, config}`.
+- `peer-board` can run offers via `POST /api/v1/verify` with `{ "node_id": "...", "offer_id": "..." }`.
+- Supported offer `kind` values (executed by `peer-board`):
+  - `sla_liveness`
+  - `sla_transcode` (config: `profile`, `timeout_seconds`)
+  - `sla_transcode_burst` (config: `profile`, `burst_count`, `timeout_seconds`, `deadline_seconds`)
+  - `sla_gpu_benchmark` (config: `benchmark_type`, `gpu_index`, `timeout_seconds`)
+  - `sla_gpu_benchmark_burst` (config: `benchmark_type`, `burst_count`, `timeout_seconds`, `deadline_seconds`)
+
+Burst workloads are the practical way to turn “claimed inventory” into a **measured lower bound** on concurrent capacity: they require multiple successes within a deadline, at unpredictable times.
+
+---
+
 ## Trust Model (CRITICAL SECTION)
 
 ### The Core Philosophy
