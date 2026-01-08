@@ -151,6 +151,9 @@ Then visit http://localhost:8080 to see the network dashboard.
 | `PAYMENTS_PAYOUT_LIVENESS_ETH` | unset | ETH payout for successful `liveness` verification |
 | `PAYMENTS_PAYOUT_TRANSCODE_ETH` | unset | ETH payout for successful `transcode` verification |
 | `PAYMENTS_PAYOUT_GPU_BENCHMARK_ETH` | unset | ETH payout for successful `gpu_benchmark` verification |
+| `PAYMENTS_OFFER_ID_LIVENESS` | unset | If set, only pay if opted-in to this offer (payout read from payments-backend offer) |
+| `PAYMENTS_OFFER_ID_TRANSCODE` | unset | If set, only pay if opted-in to this offer (payout read from payments-backend offer) |
+| `PAYMENTS_OFFER_ID_GPU_BENCHMARK` | unset | If set, only pay if opted-in to this offer (payout read from payments-backend offer) |
 
 ## Development
 

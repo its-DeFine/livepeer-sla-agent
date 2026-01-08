@@ -96,6 +96,9 @@ def create_app() -> FastAPI:
                 payout_liveness_eth=_parse_positive_decimal(os.environ.get("PAYMENTS_PAYOUT_LIVENESS_ETH", "")),
                 payout_transcode_eth=_parse_positive_decimal(os.environ.get("PAYMENTS_PAYOUT_TRANSCODE_ETH", "")),
                 payout_gpu_benchmark_eth=_parse_positive_decimal(os.environ.get("PAYMENTS_PAYOUT_GPU_BENCHMARK_ETH", "")),
+                offer_id_liveness=(os.environ.get("PAYMENTS_OFFER_ID_LIVENESS", "").strip() or None),
+                offer_id_transcode=(os.environ.get("PAYMENTS_OFFER_ID_TRANSCODE", "").strip() or None),
+                offer_id_gpu_benchmark=(os.environ.get("PAYMENTS_OFFER_ID_GPU_BENCHMARK", "").strip() or None),
             )
             _payments = PaymentsClient(config)
             await _payments.__aenter__()
@@ -524,10 +527,39 @@ def create_app() -> FastAPI:
 
         payments_result = None
         payout_eth = _payments.payout_for(request.challenge_type) if _payments else None
-        if payout_eth and result.get("success") and eth_address:
+        offer_id = _payments.offer_id_for(request.challenge_type) if _payments else None
+
+        if _payments and offer_id:
+            try:
+                offer = await _payments.get_offer(offer_id)
+                if not offer:
+                    payments_result = {"skipped": True, "reason": f"Offer not found: {offer_id}"}
+                elif not bool(offer.get("active", False)):
+                    payments_result = {"skipped": True, "reason": f"Offer inactive: {offer_id}"}
+                else:
+                    payout_eth = _parse_positive_decimal(str(offer.get("payout_amount_eth") or "")) or payout_eth
+            except Exception as exc:
+                payments_result = {"error": str(exc)}
+
+        if payout_eth and result.get("success") and eth_address and _payments and payments_result is None:
             try:
                 orchestrator_id = await _payments.resolve_orchestrator_id(eth_address)
                 if orchestrator_id:
+                    if offer_id:
+                        subscribed = await _payments.is_subscribed(orchestrator_id, offer_id)
+                        if not subscribed:
+                            return {
+                                **result,
+                                "proof_id": proof.proof_id,
+                                "proof": proof.to_dict(),
+                                "payments": {
+                                    "skipped": True,
+                                    "reason": f"Orchestrator not opted into offer {offer_id}",
+                                    "offer_id": offer_id,
+                                    "orchestrator_id": orchestrator_id,
+                                },
+                            }
+
                     artifact_hash = (
                         str(result.get("output_hash") or "").strip()
                         or hashlib.sha256(
@@ -543,7 +575,7 @@ def create_app() -> FastAPI:
                         orchestrator_id=orchestrator_id,
                         payout_amount_eth=payout_eth,
                         artifact_hash=artifact_hash,
-                        plan_id=request.challenge_type,
+                        plan_id=offer_id or request.challenge_type,
                         run_id=run_id,
                         notes=f"sla verification: type={request.challenge_type} node_id={request.node_id}",
                     )

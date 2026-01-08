@@ -7,6 +7,7 @@ payments backend configured.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
@@ -37,12 +38,19 @@ class PaymentsConfig:
     payout_liveness_eth: Optional[str] = None
     payout_transcode_eth: Optional[str] = None
     payout_gpu_benchmark_eth: Optional[str] = None
+    offer_id_liveness: Optional[str] = None
+    offer_id_transcode: Optional[str] = None
+    offer_id_gpu_benchmark: Optional[str] = None
 
 
 class PaymentsClient:
     def __init__(self, config: PaymentsConfig):
         self.config = config
         self._client: Optional[httpx.AsyncClient] = None
+        self._offers_cache: dict[str, dict] = {}
+        self._offers_cache_ts: float = 0.0
+        self._subscriptions_cache: dict[str, list[str]] = {}
+        self._subscriptions_cache_ts: float = 0.0
 
     async def __aenter__(self) -> "PaymentsClient":
         self._client = httpx.AsyncClient(timeout=15.0)
@@ -64,6 +72,85 @@ class PaymentsClient:
         if challenge_type == "gpu_benchmark":
             return self.config.payout_gpu_benchmark_eth
         return None
+
+    def offer_id_for(self, challenge_type: str) -> Optional[str]:
+        if challenge_type == "liveness":
+            return (self.config.offer_id_liveness or "").strip() or None
+        if challenge_type == "transcode":
+            return (self.config.offer_id_transcode or "").strip() or None
+        if challenge_type == "gpu_benchmark":
+            return (self.config.offer_id_gpu_benchmark or "").strip() or None
+        return None
+
+    async def get_offer(self, offer_id: str) -> Optional[dict]:
+        if not self._client:
+            raise RuntimeError("PaymentsClient not started")
+
+        offer_id = (offer_id or "").strip()
+        if not offer_id:
+            return None
+
+        now = time.time()
+        if self._offers_cache and now - self._offers_cache_ts < 30:
+            return self._offers_cache.get(offer_id)
+
+        resp = await self._client.get(
+            f"{self.config.base_url}/api/workload-offers",
+            headers={"X-Admin-Token": self.config.admin_token},
+            params={"active_only": False},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        offers = payload.get("offers", [])
+        cache: dict[str, dict] = {}
+        if isinstance(offers, list):
+            for item in offers:
+                if not isinstance(item, dict):
+                    continue
+                oid = str(item.get("offer_id") or "").strip()
+                if not oid:
+                    continue
+                cache[oid] = item
+        self._offers_cache = cache
+        self._offers_cache_ts = now
+        return self._offers_cache.get(offer_id)
+
+    async def is_subscribed(self, orchestrator_id: str, offer_id: str) -> bool:
+        if not self._client:
+            raise RuntimeError("PaymentsClient not started")
+
+        orchestrator_id = (orchestrator_id or "").strip()
+        offer_id = (offer_id or "").strip()
+        if not orchestrator_id or not offer_id:
+            return False
+
+        now = time.time()
+        if self._subscriptions_cache and now - self._subscriptions_cache_ts < 30:
+            return offer_id in (self._subscriptions_cache.get(orchestrator_id) or [])
+
+        resp = await self._client.get(
+            f"{self.config.base_url}/api/workload-offers/subscriptions",
+            headers={"X-Admin-Token": self.config.admin_token},
+        )
+        if resp.status_code == 404:
+            # Older payments-backend: no opt-in support yet.
+            self._subscriptions_cache = {}
+            self._subscriptions_cache_ts = now
+            return True
+        resp.raise_for_status()
+        payload = resp.json()
+        subs = payload.get("subscriptions", {})
+        cache: dict[str, list[str]] = {}
+        if isinstance(subs, dict):
+            for orch_id, offers in subs.items():
+                if not isinstance(orch_id, str):
+                    continue
+                if not isinstance(offers, list):
+                    continue
+                cache[orch_id] = [str(item) for item in offers if isinstance(item, str) and item]
+        self._subscriptions_cache = cache
+        self._subscriptions_cache_ts = now
+        return offer_id in (self._subscriptions_cache.get(orchestrator_id) or [])
 
     async def resolve_orchestrator_id(self, eth_address: str) -> Optional[str]:
         """Resolve payments orchestrator_id by ETH address (admin-only)."""
@@ -156,4 +243,3 @@ class PaymentsClient:
             "created": created,
             "updated": updated,
         }
-
